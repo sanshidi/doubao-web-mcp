@@ -112,11 +112,35 @@ python3 -m venv .venv
 - **IP 风控**：视频端点（skill 17）风控阈值最高。触发 `710022002/710022004` 时：
   等待冷却（约 30 分钟，期间别开豆包网页版）/ 换网络（手机热点最快）/
   在浏览器手动过一次滑块验证。对话端点基本不受影响。
-- 生成的图片带豆包官方水印（服务端 CDN 渲染，无法去除）。
-- 视频生成受豆包账号每日免费额度限制。
+- **水印**：生图默认输出**无「豆包 AI 生成」标识**的版本（详见下方「水印机制」）。
+  右下角仍会保留一个很小的「豆包」品牌标 —— 那是普通账号无法去除的部分。
+- **视频生成受豆包账号每日免费额度限制**。
 - 签名器依赖 Playwright + Chromium；仅视频功能需要，对话/图片不受影响。
 - 抖音的 aBogus 纯 Python 算法与豆包 frontierSign **不同源**（输出格式不同），无法移植；
   签名必须走浏览器页面 evaluate（已验证 `X-Bogus` 参数名 + 16 位短签名）。
+
+## 🔏 水印机制（2026-10-19 逆向 + A/B 实测）
+
+豆包在 **CDN（ImageX）渲染层**烧水印，同一个资源对象会下发多个 tplv 模板 URL，
+**模板后缀决定是否带水印**：
+
+| 模板 | 水印 |
+|---|---|
+| `~tplv-*-cgen_lwm3` / `cthumb_lwm3` | 带「豆包 AI 生成」 |
+| `~tplv-*-cgen_dwm3` / `cthumb_dwm3` | 去水印版 |
+| `~tplv-*-image_raw` | 原始图，无水印 |
+
+关键机制：
+
+1. **服务端只在 `memory_type=0`（保存到云端历史）时下发 `dwm3` / `image_raw`**；
+   `memory_type=2`（阅后即焚）只给 `lwm3`。这与豆包「AI 生成水印设置」弹窗里
+   「当前账号生成**并保存的** AI 图片、视频将不再显示水印」的措辞完全一致。
+2. **URL 签名覆盖整个 path（含模板名）**，所以手工把 `lwm3` 改成 `dwm3` 会直接
+   `400 ImageX code:2004` —— 只能让服务端自己发无水印模板。
+3. `memory_type=0` 时服务端会走 agent 通道，**忽略 `ratio` 参数**，出图比例随机。
+   本项目用「模糊背景填充」在本地把图修正到精确目标比例（主体完整不裁切）。
+4. 账号开关本身（`POST /creativity/user_config/get` → `config_map["1"].watermark_option.is_on`）
+   是账号级的，但**去水印与否最终由服务端按资源策略决定**，开关改不了已生成资源。
 
 ## 📄 协议要点（逆向笔记）
 - 对话：`POST /chat/completion`（新版端点，免签名），payload 为 `client_meta/messages[].content_block[{block_type:10000,text_block}]/option/ext` 结构，**必须带 `Agw-Js-Conv: str` 头**。
@@ -124,6 +148,9 @@ python3 -m venv .venv
 - 文生图：`/samantha/chat/completion` + `content_type:2009` + `skill_type:3`（免签名）。
 - 图生视频：`/samantha/chat/completion` + `content_type:2020` + `skill_type:17` + `X-Bogus` 签名，
   响应 SSE 提取 `fin_reason.async_task.id` → 轮询 `/samantha/chat/async/stream`。
+- 水印相关：`POST /creativity/user_config/{get,set}`（开关）、
+  `POST /alice/resource/watermark_download`（换下载模板）、
+  `POST /creativity/resource/get_without_watermark`（无水印资源判定）。
 - 凭证：`sessionid` Cookie（登录态）；`msToken` 假值会触发 710022002，留空最安全。
 - 响应头 `x-ms-token` 可用于 msToken 轮换（当前未启用）。
 
