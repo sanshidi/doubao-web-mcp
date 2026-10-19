@@ -220,11 +220,16 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
             result = await c.generate_image(prompt, ratio=ratio, ref_image_key=ref_key)
             if not result.images:
                 return "⚠️ 未拿到图片（可能被风控，先用 doubao_ping 探测）"
-            key = result.images[0].key
-            url_info = await c.get_file_download_url(key)
-            url = url_info.get("main_url") or url_info.get("url") or ""
+            img = result.images[0]
+            # 结果里已自带 CDN 直链，优先用；没有才再调一次换链接口
+            url = getattr(img, "ori_url", "") or getattr(img, "raw_url", "") or ""
             if not url:
-                return f"⚠️ 拿到图片 key 但换取下载链接失败：{key[:60]}"
+                info = await c.get_file_download_url(img.key)
+                # 该接口在不同版本返回 dict 或 str，两种都兼容
+                url = info if isinstance(info, str) else (
+                    info.get("main_url") or info.get("url") or "")
+            if not url:
+                return f"⚠️ 拿到图片 key 但换取下载链接失败：{img.key[:60]}"
         path = _save(url, ".png")
         return f"✅ 图片已保存：{path}"
     except Exception as e:
