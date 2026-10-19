@@ -9,13 +9,16 @@ doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 图生视�
     "签名器"，不作为请求通道；对话/图片全程无浏览器。
   - 多账号：账号池轮换 + 手动切换
 
-凭证配置（二选一）：
+凭证配置（三选一，优先级从上到下）：
   1. 环境变量 DOUBAO_ACCOUNTS = "名字1:cookie串1;名字2:cookie串2"
      （cookie 串为 k=v,k=v 形式，至少含 sessionid=xxx）
-  2. 账号池文件 DOUBAO_ACCOUNTS_FILE（默认 ~/.doubao_browser/accounts.json，
-     doubao2api 扫码登录后自动生成，直接兼容）
+  2. 账号池文件 DOUBAO_ACCOUNTS_FILE（默认 ~/.doubao-mcp/accounts.json）
+     —— 用本仓库的 login.py 扫码登录后自动生成
+  3. 兼容旧路径 ~/.doubao_browser/accounts.json：需显式设置
+     DOUBAO_LEGACY_ACCOUNTS=1（仅为从 doubao2api 迁移准备的退路，
+     正常运行不需要，本项目不依赖 doubao2api）
 
-依赖：aiohttp / httpx / mcp(<2) / playwright（仅视频签名用）
+依赖：httpx / mcp(<2) / playwright（仅视频签名用）
 """
 
 import asyncio
@@ -45,8 +48,29 @@ DEFAULT_FP = "verify_mlcfw5f7_TPq0YmFD_NrsC_4RuQ_BJPg_M5W7i58I7wV0"
 
 # ---------------------------------------------------------------- 账号池
 
+NATIVE_POOL = "~/.doubao-mcp/accounts.json"
+LEGACY_POOL = "~/.doubao_browser/accounts.json"   # doubao2api 的目录，仅迁移退路
+
+
+def _read_pool(path: str):
+    """读一个账号池文件，返回 (账号列表, active 名)。"""
+    p = Path(path).expanduser()
+    if not p.exists():
+        return [], None
+    try:
+        data = json.loads(p.read_text())
+    except Exception:
+        return [], None
+    accounts = [
+        {"name": a.get("name", "未命名"), "cookies": a.get("cookies", {})}
+        for a in data.get("accounts", [])
+        if a.get("cookies", {}).get("sessionid")
+    ]
+    return accounts, data.get("active")
+
+
 def _load_accounts():
-    """加载账号池：优先环境变量 DOUBAO_ACCOUNTS，其次账号池文件。"""
+    """加载账号池：环境变量 > 原生账号池文件 > （可选）旧路径。"""
     raw = os.environ.get("DOUBAO_ACCOUNTS", "").strip()
     accounts = []
     if raw:
@@ -66,30 +90,30 @@ def _load_accounts():
                     cookies[k.strip()] = v.strip()
             if cookies.get("sessionid"):
                 accounts.append({"name": name.strip(), "cookies": cookies})
-    if not accounts:
-        f = os.environ.get("DOUBAO_ACCOUNTS_FILE", "~/.doubao_browser/accounts.json")
-        p = Path(f).expanduser()
-        if p.exists():
-            try:
-                data = json.loads(p.read_text())
-                for a in data.get("accounts", []):
-                    if a.get("cookies", {}).get("sessionid"):
-                        accounts.append({"name": a.get("name", "未命名"),
-                                         "cookies": a["cookies"]})
-            except Exception:
-                pass
-    return accounts
+    if accounts:
+        return accounts, None
+
+    accounts, active = _read_pool(os.environ.get("DOUBAO_ACCOUNTS_FILE", NATIVE_POOL))
+    if accounts:
+        return accounts, active
+    if os.environ.get("DOUBAO_LEGACY_ACCOUNTS") == "1":
+        accounts, _ = _read_pool(LEGACY_POOL)
+        if accounts:
+            return accounts, None
+    return [], None
 
 
 _ACTIVE = None
 
 
 def _pick_account():
-    accounts = _load_accounts()
+    accounts, active = _load_accounts()
     if not accounts:
         return None, None
-    acc = _ACTIVE or accounts[0]
-    return accounts, acc
+    acc = _ACTIVE
+    if acc is None and active:                     # 账号池文件里指定的默认账号
+        acc = next((a for a in accounts if a["name"] == active), None)
+    return accounts, acc or accounts[0]
 
 
 def _new_client(acc: dict, timeout: float = 180) -> DoubaoChatClient:
@@ -127,14 +151,15 @@ def _save(url: str, suffix: str) -> str:
 @mcp.tool()
 def doubao_accounts(action: str = "list", name: str = "") -> str:
     """管理豆包账号池。action: list（列出）/ switch（切换，需 name）。
-    账号来源：环境变量 DOUBAO_ACCOUNTS 或 ~/.doubao_browser/accounts.json。"""
+    账号来源：环境变量 DOUBAO_ACCOUNTS 或账号池文件 ~/.doubao-mcp/accounts.json
+    （由本仓库 login.py 扫码登录生成）。"""
     global _ACTIVE
-    accounts = _load_accounts()
+    accounts, _ = _load_accounts()
     if not accounts:
         return ("⚪ 账号池为空。两种配置方式：\n"
-                "1) MCP 配置 env: DOUBAO_ACCOUNTS=\"名字1:sessionid=xxx;名字2:sessionid=yyy\"\n"
-                "2) 账号池文件 ~/.doubao_browser/accounts.json"
-                "（doubao2api 扫码登录后自动生成，直接兼容）")
+                "1) 跑一次扫码登录（推荐）：~/doubao-mcp/.venv/bin/python ~/doubao-mcp/login.py\n"
+                "   扫码成功后自动写入 ~/.doubao-mcp/accounts.json\n"
+                "2) MCP 配置 env: DOUBAO_ACCOUNTS=\"名字1:sessionid=xxx;名字2:sessionid=yyy\"")
     if action == "switch" and name:
         for a in accounts:
             if a["name"] == name:

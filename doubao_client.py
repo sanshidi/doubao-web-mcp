@@ -499,8 +499,9 @@ class DoubaoChatClient:
 
         # Resolve captcha handler
         if captcha_handler == "auto":
-            # vendored 版不含 AutoCaptchaHandler，降级为无处理器
-            log.warning("captcha_handler='auto' 在独立版中不可用，已降级为无处理器")
+            # vendored 版不含 AutoCaptchaHandler（它依赖 doubao2api 的浏览器上下文），
+            # 静默降级为无处理器——每次构造 client 都告警一次纯属噪声。
+            # 出现 710022004 人机验证时，本项目建议换 IP / 手动过滑块，而非在这里自动重试。
             self._captcha_handler: Optional["CaptchaHandler"] = None
         elif captcha_handler is None:
             self._captcha_handler = None

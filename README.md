@@ -38,16 +38,25 @@ MCP 工具层
 
 ```bash
 python3 -m venv .venv
-.venv/bin/pip install "mcp[cli]<2" aiohttp httpx playwright
+.venv/bin/pip install -r requirements.txt
 .venv/bin/python -m playwright install chromium
 ```
 
-### 方式一：账号池文件（零配置，推荐）
+### 步骤一：扫码登录拿凭证（本项目自带，不依赖任何外部服务）
 
-如果你本地跑过 [doubao2api](https://github.com/SeiShonagon520/doubao2api) 并扫码登录过，
-`~/.doubao_browser/accounts.json` 会自动生成，本 MCP **直接兼容读取**，无需任何配置。
+```bash
+.venv/bin/python login.py            # 无 GUI 环境：截二维码到 /tmp，手机扫
+.venv/bin/python login.py --headed   # 在自己终端跑：可见浏览器窗口扫码
+.venv/bin/python login.py --name 主号
+```
 
-### 方式二：环境变量显式配置
+登录成功后凭证写入 `~/.doubao-mcp/accounts.json`（权限 600）。
+多账号就多跑几次，`--name` 区分，凭证会累积进同一个账号池。
+
+`login.py` 会自动完成：点开登录弹窗 → 勾选用户协议 → 清掉「下载电脑版」推广弹窗
+→ 截取二维码（2 倍分辨率）→ 轮询 `sessionid` 落地。
+
+### 步骤二：注册 MCP
 
 ```json
 {
@@ -56,7 +65,6 @@ python3 -m venv .venv
       "command": "/path/to/.venv/bin/python",
       "args": ["/path/to/direct_server.py"],
       "env": {
-        "DOUBAO_ACCOUNTS": "主号:sessionid=xxx,ttwid=yyy;小号:sessionid=zzz",
         "DOUBAO_OUT_DIR": "/Users/you/Downloads/豆包输出"
       }
     }
@@ -64,11 +72,23 @@ python3 -m venv .venv
 }
 ```
 
-Cookie 获取：浏览器登录 doubao.com → F12 → Application → Cookies → 复制 `sessionid`（必需）
-和 `ttwid` / `passport_csrf_token`（可选，带上更稳）。
+凭证默认从 `~/.doubao-mcp/accounts.json` 读，无需其他配置。
 
-多账号用 `;` 分隔，每个账号至少含 `sessionid`。额度耗尽或风控时，
-用 `doubao_accounts(action="switch", name="小号")` 热切换。
+<details>
+<summary>不想用 login.py？手动填 Cookie</summary>
+
+浏览器登录 doubao.com → F12 → Application → Cookies → 复制 `sessionid`（必需）
+和 `ttwid` / `passport_csrf_token`（可选，带上更稳），然后：
+
+```json
+"env": {
+  "DOUBAO_ACCOUNTS": "主号:sessionid=xxx,ttwid=yyy;小号:sessionid=zzz"
+}
+```
+
+多账号用 `;` 分隔。环境变量优先级高于账号池文件。
+额度耗尽或风控时用 `doubao_accounts(action="switch", name="小号")` 热切换。
+</details>
 
 ## 📦 文件
 
@@ -76,6 +96,16 @@ Cookie 获取：浏览器登录 doubao.com → F12 → Application → Cookies �
 |---|---|
 | `direct_server.py` | MCP 服务（5 个工具 + 账号池） |
 | `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖，`generate_video` 增加 X-Bogus 签名） |
+| `login.py` | 扫码登录 → 抓 `sessionid` 写账号池（本项目自有能力） |
+
+## 🔓 独立性
+
+本项目**运行时零外部依赖**：不启动任何本地服务、不依赖 doubao2api 或 Playwright 常驻的
+请求通道（浏览器仅在视频签名时临时拉起）、不需要 API Key。
+
+`doubao_client.py` 中的 `doubao2api` 仅出现在**代码来源署名**（见 `NOTICE`），
+运行期不再读取它的任何文件或端口。从 doubao2api 迁来的旧账号池文件默认也不读，
+确需读取时显式设 `DOUBAO_LEGACY_ACCOUNTS=1`。
 
 ## ⚠️ 已知限制
 
