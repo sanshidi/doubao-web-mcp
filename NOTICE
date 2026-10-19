@@ -33,7 +33,22 @@ Copyright 2026 sanshidi
    - `VideoGenerationResult` 新增 `conversation_id` / `agent_reply` / `task_id` 字段。
    - 额度结论：免费体验套餐在扣费环节被拦（「不可用于创作使用」）；有每日免费额度的账号
      （如 ipone，Seedance 2.0 每日 10 次）可正常出片。详见 README「视频生成协议」章节。
-5. **降级** `captcha_handler` 为 no-op（原实现依赖 doubao2api 的浏览器上下文）。
+5. **新增新统一端点协议 chat_ability（2026-10-19，模型选择的关键）**：
+   - 真实前端（PC 网页版 3.41.4）走 `POST /chat/completion`（`aid=497858`，**免签名**），
+     与 samantha 的 skill content 字典是两套协议；模型/比例/时长/风格选择挂在
+     `chat_ability.ability_param` 里（图片 ability_type=3 嵌套包装，视频 ability_type=17 扁平结构）。
+   - 新增方法组：`_new_endpoint_params()` / `_build_ability_payload()` / `_post_ability()` /
+     `_parse_image_ability_sse()` / `_parse_ability_ack()` / `_parse_ability_ack_full()` /
+     `_is_video_confirm_card()` / `_send_ability_followup()` /
+     `_generate_image_ability()` / `_generate_video_ability()`。
+   - 官方模型/风格清单（`IMAGE_MODELS` / `VIDEO_MODELS` / `IMAGE_STYLES` 常量）挖自
+     `POST /alice/slot/action_bar_v3/get_item_conf`（选择器是双层嵌套 JSON，需递归解析）。
+   - 视频是两步流程：提交 → 服务端回「参数确认卡」（界面无按钮，靠文字回复推进）→
+     带会话上下文发「确认」→ 任务真正提交（响应出现 `block_type=10040`
+     thinking_block「视频生成已提交」）。
+   - samantha 旧协议实证：content 被服务端剥成纯文本走 agent 通道，`image-model` /
+     `video-model` 键被丢弃，模型选择无效（请求付费档仍正常出图 = 被忽略）。
+6. **降级** `captcha_handler` 为 no-op（原实现依赖 doubao2api 的浏览器上下文）。
 6. 移除对 doubao2api 会话文件格式的运行期依赖：凭证改由本项目自带的 `login.py` 抓取，
    写入 `~/.doubao-mcp/accounts.json`（原实现读 `~/.doubao_browser/accounts.json`）。
 

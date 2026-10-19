@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
-doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 图生视频优先）
+doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 模型选择）
 
 架构（逐层实验验证）：
-  - 对话 / 图片上传 / 文生图：纯 HTTP 直连，无需签名
-  - 图生视频：需 X-Bogus 签名 → 签名器常驻一个 headless 浏览器页面
-    evaluate window.bdms.frontierSign() 拿签名（毫秒级）。浏览器只当
-    "签名器"，不作为请求通道；对话/图片全程无浏览器。
+  - 对话 / 文生图 / 文生视频：纯 HTTP 直连 doubao.com，全程免签名
+    （X-Bogus 签名已失效，加签名反而触发 710022004 风控，详见 README）
+  - 视频是异步 agent 通道：memory_type=0 提交 → 轮询会话消息取回成品
   - 多账号：账号池轮换 + 手动切换
 
 凭证配置（三选一，优先级从上到下）：
@@ -18,7 +17,7 @@ doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 图生视�
      DOUBAO_LEGACY_ACCOUNTS=1（仅为从 doubao2api 迁移准备的退路，
      正常运行不需要，本项目不依赖 doubao2api）
 
-依赖：httpx / mcp(<2) / playwright（仅视频签名用）
+依赖：httpx / mcp(<2)
 """
 
 import asyncio
@@ -35,6 +34,9 @@ from doubao_client import (
     DoubaoChatClient,
     DoubaoChatError,
     DoubaoRateLimitError,
+    IMAGE_MODELS,
+    IMAGE_STYLES,
+    VIDEO_MODELS,
 )
 
 mcp = FastMCP("doubao-web")
@@ -255,8 +257,56 @@ async def doubao_chat(prompt: str, model: str = "doubao") -> str:
 
 
 @mcp.tool()
-async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") -> str:
-    """文生图或图生图。传 image_path 即为图生图。返回本地图片路径。"""
+async def doubao_models(kind: str = "all") -> str:
+    """查询豆包官方创作模型与风格清单（图片/视频）。
+
+    kind: image / video / style / all（默认 all）
+    返回官方 option_key（直接传给 doubao_image 的 image_model/style、
+    doubao_video 的 video_model 参数），标注付费墙（需订阅）与消耗倍率。
+    """
+    lines = []
+    if kind in ("image", "all"):
+        lines.append("🖼 图片模型（doubao_image image_model=）")
+        for key, info in IMAGE_MODELS.items():
+            mark = " 🔒需订阅" if info.get("need_upgrade") else ""
+            lines.append(f"  - {key}（{info.get('sub', '')}{mark}）")
+        lines.append("")
+    if kind in ("video", "all"):
+        lines.append("🎬 视频模型（doubao_video video_model=）")
+        for key, info in VIDEO_MODELS.items():
+            mark = " 🔒需订阅" if info.get("need_upgrade") else ""
+            lines.append(f"  - {key}（{info.get('display', key)}・{info.get('sub', '')}{mark}）")
+        lines.append("")
+    if kind in ("style", "all"):
+        lines.append(f"🎨 图片风格（doubao_image style=，共 {len(IMAGE_STYLES)} 种）")
+        for key, name in IMAGE_STYLES.items():
+            lines.append(f"  - {key}（{name}）")
+        lines.append("")
+    lines.append("比例：图片 1:1/16:9/9:16/4:3/3:4/21:9；视频另支持 3:4/4:3")
+    lines.append("视频时长：5 / 10 秒")
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def doubao_image(
+    prompt: str,
+    image_path: str = "",
+    ratio: str = "1:1",
+    image_model: str = "",
+    style: str = "",
+) -> str:
+    """文生图或图生图。传 image_path 即为图生图。返回本地图片路径。
+
+    ratio: 1:1 / 16:9 / 9:16 / 4:3 / 3:4 / 21:9
+    image_model: 图片模型（留空=服务端默认 Seedream 4.0）：
+      - Seedream 5.0 Flash（专业快速，推荐）
+      - Seedream 5.0 Pro（专业出图・4 倍消耗，需订阅）
+      - Seedream 4.5（日常生成）
+      - Seedream 4.0（基础生图）
+    style: 官方风格 option_key（32 种，完整列表见 doubao_models），
+      如 skill_image_styles_film（电影写真）/ skill_image_styles_chinese（中国风）。
+      会自动按官方规则注入「图片风格为X」到描述里。
+    """
     accounts, acc = _pick_account()
     if not acc:
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
@@ -269,7 +319,20 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
                     return f"❌ 图片不存在：{p}"
                 up = await c.upload_image(p.read_bytes(), p.name)
                 ref_key = up.get("uri", "")
-            result = await c.generate_image(prompt, ratio=ratio, ref_image_key=ref_key)
+            result = await c.generate_image(
+                prompt, ratio=ratio, ref_image_key=ref_key,
+                image_model=image_model, style=style,
+            )
+            # 付费墙/额度提示（新协议服务端返回，不出图）
+            notice = getattr(result, "notice", "") or ""
+            if notice and not result.images:
+                return (
+                    f"🔒 {notice}\n"
+                    f"   请求模型：{image_model or 'Seedream 4.0'}（需订阅档）\n"
+                    "   建议：换免费档模型重试 ——\n"
+                    "     Seedream 5.0 Flash（专业快速）/ Seedream 4.5（日常）/ Seedream 4.0（基础）\n"
+                    "   或切换有订阅的账号（doubao_accounts）。"
+                )
             if not result.images:
                 return "⚠️ 未拿到图片（可能被风控，先用 doubao_ping 探测）"
             img = result.images[0]
@@ -289,7 +352,15 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
                 return f"⚠️ 拿到图片 key 但换取下载链接失败：{img.key[:60]}"
         path = _save(url, ".png")
         path = _fit_ratio(path, ratio)
-        return f"✅ 图片已保存：{path}"
+        extra = ""
+        eff_model = getattr(result, "model", "") or image_model
+        if eff_model:
+            extra += f"\n   模型：{eff_model}"
+        if style:
+            extra += f"\n   风格：{IMAGE_STYLES.get(style, style)}"
+        if notice:
+            extra += f"\n   ⚠️ {notice}"
+        return f"✅ 图片已保存：{path}{extra}"
     except Exception as e:
         return _fail(e)
 
@@ -305,16 +376,23 @@ async def doubao_video(
 ) -> str:
     """文生视频 / 图生视频（Seedance）。传 image_path 即为图生视频。
 
-    ratio: 9:16（竖屏）/ 16:9 / 1:1 / 21:9
-    video_model: seedance_v2.0_mini（默认，1x）/ seedance_v2.0（Fast）/ seedance_v2.0_std（2x）
+    ratio: 9:16（竖屏）/ 16:9 / 1:1 / 21:9 / 3:4 / 4:3
+    video_model（官方四档，详见 doubao_models）：
+      - seedance_v2.0_mini（默认，日常生成，免费额度可跑）
+      - seedance_v2.0（Fast，快速出片，免费额度可跑）
+      - seedance_v2.0_std（2.0 进阶画面，2x 消耗，🔒需订阅）
+      - seedance_v2.5（旗舰 30 秒，5x 消耗，🔒需订阅）
     duration: 5 或 10秒
     wait: 等待成品的秒数（默认 600=10 分钟，与官方预计等待时间匹配）；
           传 0 = 只提交任务，立即返回会话链接。
 
-    🔒 账号额度说明（2026-10-19 实测）：视频生成走 agent 通道、异步渲染。
+    🔒 账号额度说明（2026-10-19 实测）：视频生成走新统一端点
+    （/chat/completion + chat_ability ability_type=17），模型/时长/比例精确选择。
+    提交后服务端先回「参数确认卡」，客户端自动二次回复「确认」，
+    任务才真正进入渲染（异步，官方口径约 10 分钟），轮询会话取回成品。
     需要账号有视频创作额度——免费体验套餐会在扣费环节被拦
     （「当前免费体验套餐不可用于创作使用」）；有每日免费额度的账号
-    （如账号池 ipone，Seedance 2.0 每日 10 次）可正常出片。
+    （如账号池 ipone，Seedance 2.0 每日 10 次）可跑 Mini/Fast 两档。
     额度查询与账号切换见 doubao_accounts。
     """
     accounts, acc = _pick_account()
@@ -345,20 +423,25 @@ async def doubao_video(
                 if url:
                     path = _save(url, ".mp4")
                     extra = f"\n   vid：{v.vid}" if getattr(v, "vid", "") else ""
+                    eff = getattr(result, "model", "")
+                    if eff:
+                        extra += f"\n   模型：{eff}"
                     return f"✅ 视频已保存：{path}{extra}"
 
             reply = getattr(result, "agent_reply", "") or ""
 
-            # 🔴 付费墙判定：套餐无视频创作额度（账号问题，非协议问题）
-            if "免费体验套餐" in reply or "升级正式订阅" in reply or "不可用于创作" in reply:
+            # 🔴 付费墙判定：套餐无视频创作额度 / 所选模型需订阅（账号问题，非协议问题）
+            if ("免费体验套餐" in reply or "升级正式订阅" in reply
+                    or "不可用于创作" in reply or "订阅标准套餐专属能力" in reply
+                    or "无该视频模型" in reply):
                 return (
                     "🔒 当前账号（"
                     + acc.get("name", "?")
-                    + "）无视频创作额度：免费体验套餐不可用于创作使用。\n"
-                    "   已确认这不是协议或风控问题：链路完全打通，模型/时长/比例参数\n"
-                    "   均被服务端正确接收，卡在最后的额度扣减环节。\n"
+                    + f"）无法使用所选模型（{video_model}）。\n"
+                    "   免费档模型：seedance_v2.0_mini / seedance_v2.0（Fast）；\n"
+                    "   需订阅档：seedance_v2.0_std（2x）/ seedance_v2.5（5x）。\n"
                     f"   豆包提示：{reply[:120]}\n"
-                    "   解决：切换有每日免费额度的账号（doubao_accounts），\n"
+                    "   解决：改用免费档模型，或切换有订阅的账号（doubao_accounts），\n"
                     "   或开通正式订阅：https://www.doubao.com/member/subscription"
                     "?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting"
                 )
@@ -371,7 +454,15 @@ async def doubao_video(
                     "   建议：稍后重试，或更换网络环境后重试。"
                 )
 
-            # 参数没被识别 —— agent 在追问，需要把参数写进自然语言
+            # 确认步骤失败（新协议两步流程的第二步行没走通）
+            if "确认步骤失败" in reply:
+                return (
+                    "⚠️ 视频任务已提交，但自动「确认」步骤失败，渲染未开始。\n"
+                    f"   详情：{reply[:200]}\n"
+                    "   可手动打开会话链接回复「确认」，或稍后重试。"
+                )
+
+            # 参数没被识别（仅旧通道兜底时）—— agent 在追问
             if "确认" in reply or "建议" in reply:
                 return (
                     "⚠️ 豆包未接受参数，正在追问确认，任务未生成。\n"
@@ -387,7 +478,7 @@ async def doubao_video(
             )
             lines = [
                 "⏳ 视频任务已提交（异步渲染，官方口径约 10 分钟）",
-                f"   模型：{video_model} · 时长 {duration}s · 比例 {ratio}",
+                f"   模型：{getattr(result, 'model', '') or video_model} · 时长 {duration}s · 比例 {ratio}",
             ]
             if reply:
                 lines.append(f"   豆包回复：{reply[:150]}")

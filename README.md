@@ -1,6 +1,6 @@
 # doubao-web-mcp
 
-豆包网页版能力接入 MCP —— 让 AI 助手直接调用你的豆包网页账号：**对话 / 文生图 / 图生视频 / 多账号轮换**。
+豆包网页版能力接入 MCP —— 让 AI 助手直接调用你的豆包网页账号：**对话 / 文生图 / 图生视频 / 模型选择 / 多账号轮换**。
 
 参考 [web-ai-mcp](https://github.com/983033995/web-ai-mcp)（DeepSeek 网页版接入）的思路，零服务依赖、token 级配置、开箱即用。
 
@@ -9,8 +9,9 @@
 | 工具 | 功能 | 传输方式 |
 |---|---|---|
 | `doubao_chat` | 文本对话 / 写稿 / 审片 / 起标题（支持深度思考） | 纯 HTTP，免签名 |
-| `doubao_image` | 文生图 / 图生图，自动落盘 | 纯 HTTP，免签名 |
-| `doubao_video` | 文生视频 / **图生视频**，轮询会话取回成品并落盘 mp4 | 纯 HTTP，免签名 |
+| `doubao_image` | 文生图 / 图生图，**四档图片模型 + 32 种风格**可选，自动落盘 | 纯 HTTP，免签名 |
+| `doubao_video` | 文生视频 / 图生视频，**四档视频模型 + 时长/比例**可选，轮询会话取回成品并落盘 mp4 | 纯 HTTP，免签名 |
+| `doubao_models` | 查询官方模型/风格清单（含付费墙与消耗倍率标注） | — |
 | `doubao_accounts` | 账号池管理（list / switch 多账号切换） | — |
 | `doubao_ping` | 链路自检（登录态 + IP 风控状态） | — |
 
@@ -19,13 +20,14 @@
 ```
 MCP 工具层
    │
-   ├─ 对话 / 图片 ──→ 纯 HTTP 直连 doubao.com（免签名，快）
+   ├─ 文生图 / 文生视频 ──→ 新统一端点 /chat/completion（chat_ability 协议，
+   │                        免签名）模型/时长/比例/风格精确选择
+   │                        │
+   │                        └─（视频异步）轮询会话消息 latest_messagelist
+   │                              │
+   │                          提取卡片 → 下载落盘
    │
-   └─ 视频 ──→ HTTP 提交（agent 通道，launch_stage=2）
-                  │
-              轮询会话消息（latest_messagelist）
-                  │
-              提取视频卡片 → 下载 mp4 落盘
+   └─ 图生图 / 兜底 ────→ 旧 /samantha/chat/completion（agent 通道）
 ```
 
 **全程零浏览器**：对话/图片/视频都不需要 Playwright（签名器已废弃，见「已知限制」）。
@@ -92,8 +94,8 @@ python3 -m venv .venv
 
 | 文件 | 说明 |
 |---|---|
-| `direct_server.py` | MCP 服务（5 个工具 + 账号池） |
-| `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖；视频链路增加 agent 通道取回：会话轮询 + 视频卡片解析） |
+| `direct_server.py` | MCP 服务（6 个工具 + 账号池） |
+| `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖；双协议：新统一端点 chat_ability〔模型选择〕+ 旧 samantha agent 通道〔兜底/图生图〕，含会话轮询取回与卡片解析） |
 | `login.py` | 扫码登录 → 抓 `sessionid` 写账号池（本项目自有能力） |
 
 ## 🔓 独立性
@@ -107,12 +109,12 @@ python3 -m venv .venv
 
 ## ⚠️ 已知限制
 
-- **🔒 视频生成需要账号有创作额度（2026-10-19 定论）**：这是**账号套餐限制，不是协议或风控问题**。
-  链路已完全打通 —— `content_type=2020` + `skill_type=17` + `launch_stage=2` 会被服务端正确
-  接收，agent 回复「正在为您生成视频…」并走到**额度扣减环节**：
-  - 免费体验套餐：返回「当前免费体验套餐不可用于创作使用，可升级正式订阅」（任务不创建）；
-  - 有每日免费额度的账号（如账号池 `ipone`，Seedance 2.0 每日 10 次）：正常出片，
-    客户端轮询会话取回 mp4（详见下方「视频生成协议」）。
+- **🔒 模型额度按账号套餐门控（2026-10-19 定论）**：这是**账号套餐限制，不是协议或风控问题**。
+  新端点会按所选模型查额度——免费账号可跑免费档（Seedream 5.0 Flash / 4.5 / 4.0，
+  Seedance 2.0 Mini / 2.0 Fast）；请求需订阅档（Seedream 5.0 Pro、Seedance 2.0 / 2.5）时
+  服务端**明确返回不出图**（「这是豆包订阅标准套餐专属能力」+ `unavailable_reason`），
+  已 A/B 实证：同一账号同一 prompt，免费档正常出图、Pro 档零图片。
+  旧 agent 通道（samantha）则在扣费环节拦（「不可用于创作使用」）。
   开通入口：
   `https://www.doubao.com/member/subscription?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting`
 - **不要给请求加 X-Bogus 签名**（2026-10-19 推翻旧结论）：签名器产出的签名已不被豆包认可，
@@ -196,6 +198,71 @@ POST /alice/conversation/latest_messagelist?{security_params}
 去掉 `bot_id` / 只传 conv+sec / 旧格式 `section_id` / `last_message_index+1` / 空对象）
 **全部返回 `710020702`**，且第2 轮请求不会在服务端创建可复用会话，对话实际无法续接。
 
+## 🧩 新统一端点协议 chat_ability（2026-10-19 抓包地面真值 · 模型选择的关键）
+
+真实前端（PC 网页版 3.41.4）走 **`POST /chat/completion`**（`aid=497858`，**免签名**），
+与 samantha 的 skill content 字典是**两套协议**。模型/比例/时长/风格的选择挂在
+`chat_ability.ability_param` 里：
+
+```
+POST /chat/completion?aid=497858&doubao_pc_version=3.41.4&...   # 免签名！
+{
+  "client_meta": {...},                   # local_conversation_id / bot_id / local_permissions
+  "messages": [{                          # content_block[0].block_type=10000 纯文本
+    "content_block": [{"block_type": 10000,
+      "content": {"text_block": {"text": "生成图片：<prompt>"}}}]
+  }],
+  "option": {...},                        # conversation_mode=1 / message_storage_type=0 ...
+  "chat_ability": {
+    "ability_type": 3,                    # 3=图片；17=视频
+    "ability_param": "<JSON 字符串>"
+  },
+  "ext": {...}
+}
+```
+
+`ability_param` 内部结构（图片/视频**不同**，均为抓包真值）：
+
+| 能力 | ability_type | ability_param 结构 |
+|---|---|---|
+| 图片 | 3 | **嵌套包装**：`{"ability_param": {"model", "ratio", "input_box_content"}, "ability_type": 1}` |
+| 视频 | 17 | **扁平**：`{"ratio", "model", "duration", "input_box_content"}` |
+
+- `model`：图片传显示文本（`Seedream 5.0 Flash` 等）；视频传 option_key（`seedance_v2.0_mini` 等）
+- `ratio`：`auto` 或具体比例；视频另有 `duration`（5/10）
+- `input_box_content.user_input_content`：用户原始输入；`reply_message_format`：官方模板
+  （图片 `生成图片：%s`、视频 `生成视频：%s`）
+- 消息文本 = 模板套用后的文本（视频还会拼上 `，10s` 后缀）
+
+**响应**是命名事件 SSE（`SSE_HEARTBEAT` / `SSE_ACK` / `STREAM_CHUNK` / `CHUNK_DELTA` /
+`FULL_MSG_NOTIFY` / `SSE_REPLY_END` / `STREAM_ERROR`），与 samantha 的 `event_type:2001`
+JSON 事件不同：
+
+- `SSE_ACK.ack_client_meta.conversation_id` → 真实会话 ID（异步取回用）
+- 成品在 `STREAM_CHUNK.patch_op[].patch_value.content_block[]` → `block_type=2074`
+  → `creation_block.creations[].image`
+- 付费墙：文本块「这是豆包订阅标准套餐专属能力」+ `unavailable_reason{type:4}`，**不出图**
+
+**视频（ability_type=17）是两步流程**（2026-10-19 抓包 + 实测真值）：
+
+1. 第一条提交 → 服务端回「**视频生成参数确认**」卡（模型/时长/比例/创作方向），
+   **前端界面里也没有按钮**，靠用户文字回复推进；
+2. 第二条带 `client_meta.conversation_id`（+ `local_conversation_id` 续接上下文、
+   `need_create_conversation=false`）发纯文本「**确认**」→ 任务才真正提交，
+   响应出现 `block_type=10040` `thinking_block`（`视频生成已提交` / `视频生成中`）；
+3. 之后成品异步推送进会话，走 `latest_messagelist` 轮询取回（与旧通道相同）。
+
+> 注：旧 samantha 协议「会话续接全返回 710020702」的结论**不适用于新端点**——
+> 新端点确认回复实测正常续接（ACK 返回同一 conversation_id，agent 延续上下文）。
+
+**为什么必须用这套**：samantha 格式会把 content 剥成纯文本走 agent 通道
+（读回会话消息可见用户消息只剩 `{"text":"..."}`），结构化模型字段被丢弃——
+所以旧格式下 `image-model` / `video-model` 键**不生效**（实证：同账号请求
+Pro 档在旧格式正常出图=被忽略；新格式则正确拦截）。
+
+🔴 **浏览器的请求反而被限流**：真实前端自带 `a_bogus` 签名，而签名已失效
+（见「已知限制」），所以浏览器提交 710022004；**我们免签名直打反而 200**。
+
 ## 🔏 水印机制（2026-10-19 逆向 + A/B 实测）
 
 豆包在 **CDN（ImageX）渲染层**烧水印，同一个资源对象会下发多个 tplv 模板 URL，
@@ -222,10 +289,14 @@ POST /alice/conversation/latest_messagelist?{security_params}
 ## 📄 协议要点（逆向笔记）
 - 对话：`POST /chat/completion`（新版端点，免签名），payload 为 `client_meta/messages[].content_block[{block_type:10000,text_block}]/option/ext` 结构，**必须带 `Agw-Js-Conv: str` 头**。
 - 上传图片：`POST /samantha/pages/upload_image` → 拿 uri → `POST /alice/message/get_file_url` 换 CDN 链接。
-- 文生图：`/samantha/chat/completion` + `content_type:2009` + `skill_type:3`（免签名）。
-- 图生视频：`/samantha/chat/completion` + `content_type=2020` + `skill_type=17`（免签名），
-  `launch_stage=2` + `memory_type=0` 提交 → 轮询 `/alice/conversation/latest_messagelist`
-  取视频卡片（详见上方「视频生成协议」）。
+- 文生图（新协议，推荐）：`POST /chat/completion` + `chat_ability{ability_type:3}`，模型/比例/风格精确选择（详见「新统一端点协议」章节）。
+- 文生视频（新协议，推荐）：`POST /chat/completion` + `chat_ability{ability_type:17}`，模型/时长/比例精确选择，SSE_ACK 拿会话 → 轮询 `latest_messagelist` 取卡片。
+- 文生图/图生视频（旧 agent 通道，兜底/图生图用）：`/samantha/chat/completion` + `content_type:2009`+`skill_type:3` / `content_type=2020`+`skill_type:17`（免签名），
+  视频 `launch_stage=2` + `memory_type=0` 提交 → 轮询 `/alice/conversation/latest_messagelist`
+  取卡片。**模型选择在该通道不生效**（content 被剥成纯文本）。
+- 官方模型/风格清单：`POST /alice/slot/action_bar_v3/get_item_conf`（body `item_ids`），
+  图片项 `45033999706177282`、视频项 `45337547893174274`；选择器是双层嵌套 JSON
+  （`instruction_item_list[].template` → `selector_list[].template` → `option_list`）。
 - 水印相关：`POST /creativity/user_config/{get,set}`（开关）、
   `POST /alice/resource/watermark_download`（换下载模板）、
   `POST /creativity/resource/get_without_watermark`（无水印资源判定）。
