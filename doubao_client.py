@@ -6,6 +6,7 @@ Supports three endpoint families:
   - /samantha/chat/completion
   - /chat/completion (unified main entry, desktop client)
 """
+import asyncio
 import base64
 import hashlib
 import hmac as hmac_mod
@@ -13,6 +14,7 @@ import json
 import logging
 import os
 import re
+import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
@@ -355,20 +357,22 @@ class GeneratedVideo:
     width: int = 0
     height: int = 0
     duration: float = 0.0
+    vid: str = ""
 
 
 @dataclass
 class VideoGenerationResult:
     """Result of a video generation call.
 
-    🔴 2026-10-19：豆包视频实际是**异步**的，且请求会被降级为 agent 对话。
-    即使 ``launch_stage=2`` 触发了 Seedance，响应里也只有 agent 文本
-    （「本次使用 Seedance 2.0 Mini 生成，预计等待 10 分钟…」），
-    没有 task_id / vid / mp4。成品由云端渲染完成后推送到会话。
+    🔴 2026-10-19 实测结论（ipone 账号端到端跑通）：
+    豆包视频是**异步 agent 通道**——``launch_stage=2`` 提交后 SSE 里只有
+    agent 文本（「正在为您生成视频…」），没有 task_id / vid / mp4。
+    成品由云端渲染完成后作为新消息（``block_type=2074`` 的 creations 卡片）
+    推送进会话。取回方式：轮询 ``/alice/conversation/latest_messagelist``。
 
-    因此新增两个字段承载"任务已提交"的证据，供上层回传给用户：
-      conversation_id: 任务所在会话
-      agent_reply:豆包 agent 的原始回复文本
+    🔴 另一个关键点：提交必须 ``memory_type=0``（保存云端）。
+    阅后即焚(2)的会话不落库，成品推送无处落地，任务直接孤儿化
+    （线程列表不出现、``query_video_gen_info`` 也无记录）。
     """
     videos: List[GeneratedVideo] = field(default_factory=list)
     prompt: str = ""
@@ -1804,6 +1808,7 @@ class DoubaoChatClient:
         video_model: str = "seedance_v2.0_mini",
         video_duration: int = 10,
         launch_stage: int = 2,
+        poll_timeout: float = 900,
     ) -> "VideoGenerationResult":
         """Generate video using Doubao's AI video generation.
 
@@ -1829,6 +1834,8 @@ class DoubaoChatClient:
             video_duration: 官方时长档，只支持 5 / 10（默认 10）。
             launch_stage: ``2``= 直接进入生成（实测唯一能真正触发 Seedance 的档）；
                 ``1``/``0`` 会降级为 agent 反复追问参数、任务不落地。
+            poll_timeout: agent 通道取回成品的最长等待秒数（默认 900=15 分钟，
+                与 agent 口头预计的等待时间匹配）。
 
         Returns:
             VideoGenerationResult with list of generated videos.
@@ -1887,7 +1894,16 @@ class DoubaoChatClient:
         for k in keys:
             message["attachments"].append({"type": "image", "key": k})
 
-        eff_mem_type = resolve_memory_type(memory_type, save_history)
+        # 🔴 2026-10-19 关键修复：视频提交必须 memory_type=0（保存云端）。
+        # 阅后即焚(2)的会话不落库 → agent 成品推送无处落地 → 任务孤儿化
+        # （线程列表不出现、query_video_gen_info 无记录、永远拿不到 vid）。
+        # 图片链路恰好因为去水印需求强制了 0，所以图片能取回而视频不能。
+        if memory_type is not None:
+            eff_mem_type = int(memory_type)
+        elif save_history is not None:
+            eff_mem_type = 0 if save_history else 2
+        else:
+            eff_mem_type = 0
         sent_event: Dict[str, Any] = {
             "messages": [message],
             "completion_option": {
@@ -1910,6 +1926,9 @@ class DoubaoChatClient:
             "local_conversation_id": str(uuid.uuid4()),
             "local_message_id": str(uuid.uuid4()),
         }
+
+        # 提交前快照会话列表（SSE 拿不到 conv_id 时，靠对比它发现新会话）
+        before_ids = await self._snapshot_conversation_ids()
 
         url = self._plain_url("/samantha/chat/completion")
         headers = {
@@ -1964,15 +1983,216 @@ class DoubaoChatClient:
             # Try parsing as sync response (content_type=2021)
             result = self._parse_video_sse(raw, prompt)
 
-            # 异步/agent 通道：把会话与agent 回复带出去，供上层告知用户去哪取成品
+            # 异步/agent 通道：把会话与 agent 回复带出去，供上层告知用户
             conv_id, agent_text = self._parse_sse_agent_meta(raw)
             result.conversation_id = conv_id
             result.agent_reply = agent_text
             result.prompt = prompt
+
+            # 风控拦截：IP 被 shark_admin 标记时 agent 直接不回
+            if "710022004" in raw or "710022002" in raw:
+                result.agent_reply = (
+                    f"{agent_text}\n[风控] 请求被豆包网关拦截（710022004），"
+                    "请稍后重试或更换网络环境。"
+                ).strip()
+                return result
+
+            # 付费墙：免费体验套餐不可用于创作（账号问题，非协议问题）
+            if "不可用于创作" in agent_text or "升级正式订阅" in agent_text:
+                result.agent_reply += "（当前账号无视频创作额度，需更换有每日免费额度的账号）"
+                return result
+
+            # 参数追问：agent 还在反问、没真正提交任务
+            if not conv_id and ("时长" in agent_text or "确认" in agent_text):
+                return result
+
+            # 任务已提交 → 轮询会话，等云端渲染完成后取回成品
+            await self._poll_conversation_video(result, before_ids, poll_timeout)
             return result
 
         # Phase 2: Poll /samantha/chat/async/stream for video result
         return await self._poll_async_video(task_id, prompt, timeout)
+
+    # ---- 会话轮询取回（2026-10-19 实测打通） ----
+
+    async def _post_json(
+        self, path: str, body: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """POST JSON 到豆包 API（免签名）并解析为 dict。"""
+        url = self._plain_url(path)
+        headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://www.doubao.com/chat",
+        }
+        async with self.session.post(
+            url,
+            data=json.dumps(body or {}, ensure_ascii=False),
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30),
+        ) as resp:
+            status = resp.status
+            text = await resp.text()
+        try:
+            return json.loads(text)
+        except json.JSONDecodeError:
+            return {"_raw": text[:2000], "_http_status": status}
+
+    async def _snapshot_conversation_ids(self) -> set:
+        """线程列表里的会话 ID 集合（用于发现提交后新建的会话）。"""
+        try:
+            d = await self._post_json("/samantha/im/conversation/list", {})
+            return {
+                str(t["conversation"]["conversation_id"])
+                for t in d.get("data", {}).get("thread_list", [])
+            }
+        except Exception:  # noqa: BLE001
+            return set()
+
+    async def _discover_new_conversation(self, before_ids: set) -> str:
+        """SSE 没给 conv_id 时，对比线程列表找提交后新建的会话。"""
+        for _ in range(12):
+            try:
+                d = await self._post_json("/samantha/im/conversation/list", {})
+                for t in d.get("data", {}).get("thread_list", []):
+                    cid = str(t["conversation"]["conversation_id"])
+                    if cid not in before_ids:
+                        return cid
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(5)
+        return ""
+
+    async def _poll_conversation_video(
+        self,
+        result: "VideoGenerationResult",
+        before_ids: set,
+        poll_timeout: float,
+    ) -> None:
+        """轮询会话消息，直到视频卡片（block_type=2074）出现并回填 videos。
+
+        轮询端点 ``POST /alice/conversation/latest_messagelist``，
+        body ``{"request_list": [{"conversation_id": <字符串>, "message_index": 0, "count": 20}]}``
+        —— conversation_id 必须传**字符串**，传数字返回空。
+        """
+        conv_id = result.conversation_id
+        if not conv_id:
+            conv_id = await self._discover_new_conversation(before_ids)
+            result.conversation_id = conv_id
+        if not conv_id:
+            if not result.agent_reply:
+                result.agent_reply = "任务已提交，但未能定位会话，无法取回成品。"
+            return
+
+        url = self._plain_url("/alice/conversation/latest_messagelist")
+        headers = {
+            "Content-Type": "application/json",
+            "Referer": "https://www.doubao.com/chat",
+        }
+        body = json.dumps(
+            {
+                "request_list": [
+                    {
+                        "conversation_id": str(conv_id),
+                        "message_index": 0,
+                        "count": 20,
+                    }
+                ]
+            },
+            ensure_ascii=False,
+        )
+        start = time.time()
+        while time.time() - start < poll_timeout:
+            try:
+                async with self.session.post(
+                    url,
+                    data=body,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=30),
+                ) as resp:
+                    text = await resp.text()
+                d = json.loads(text)
+                msgs: List[Dict[str, Any]] = []
+                for group in d.get("data", {}).get("message_map", {}).values():
+                    if isinstance(group, list):
+                        msgs.extend(group)
+                msgs.sort(key=lambda m: m.get("index", 0))
+                video = self._extract_video_from_messages(msgs)
+                if video is not None:
+                    result.videos.append(video)
+                    return
+            except Exception:  # noqa: BLE001
+                pass
+            await asyncio.sleep(15)
+        if not result.agent_reply:
+            result.agent_reply = "视频仍在生成中，请在豆包网页端会话查看。"
+
+    @staticmethod
+    def _extract_video_from_messages(
+        msgs: List[Dict[str, Any]]
+    ) -> Optional[GeneratedVideo]:
+        """从会话消息里找视频卡片（block_type=2074 → creations → video）。
+
+        优先取 ``video_model.video_list.video_1.main_url``（base64 编码，
+        720p 完整文件）；``download_url`` 实测只能拿到截断文件，仅作兜底。
+        """
+        for m in msgs:
+            content = m.get("content", "")
+            if not isinstance(content, str) or "2074" not in content:
+                continue
+            try:
+                blocks = json.loads(content)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(blocks, list):
+                continue
+            for b in blocks:
+                if not isinstance(b, dict) or b.get("block_type") != 2074:
+                    continue
+                try:
+                    card = json.loads(b.get("content", "{}"))
+                except json.JSONDecodeError:
+                    continue
+                for cr in card.get("creations") or []:
+                    v = cr.get("video") or {}
+                    if not v:
+                        continue
+                    width = int(v.get("width") or 0)
+                    height = int(v.get("height") or 0)
+                    url = ""
+                    vm_str = v.get("video_model", "")
+                    if vm_str:
+                        try:
+                            vm = (
+                                json.loads(vm_str)
+                                if isinstance(vm_str, str)
+                                else vm_str
+                            )
+                            for q in ("video_1", "video_2"):
+                                vi = vm.get("video_list", {}).get(q) or {}
+                                main_b64 = vi.get("main_url", "")
+                                if main_b64:
+                                    url = base64.b64decode(main_b64).decode(
+                                        "utf-8", errors="replace"
+                                    )
+                                    width = int(vi.get("width") or width)
+                                    height = int(vi.get("height") or height)
+                                    break
+                        except Exception:  # noqa: BLE001
+                            url = ""
+                    if not url:
+                        url = v.get("download_url", "")
+                    cover = v.get("cover") or {}
+                    cover_url = (cover.get("image_preview") or {}).get("url", "")
+                    if url:
+                        return GeneratedVideo(
+                            video_url=url,
+                            cover_url=cover_url,
+                            width=width,
+                            height=height,
+                            duration=float(v.get("duration") or 0.0),
+                            vid=v.get("vid", ""),
+                        )
+        return None
 
     @staticmethod
     def _parse_sse_agent_meta(raw: str) -> Tuple[str, str]:

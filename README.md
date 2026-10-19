@@ -10,7 +10,7 @@
 |---|---|---|
 | `doubao_chat` | 文本对话 / 写稿 / 审片 / 起标题（支持深度思考） | 纯 HTTP，免签名 |
 | `doubao_image` | 文生图 / 图生图，自动落盘 | 纯 HTTP，免签名 |
-| `doubao_video` | 文生视频 / **图生视频**，自动落盘 mp4 | HTTP + X-Bogus 签名 |
+| `doubao_video` | 文生视频 / **图生视频**，轮询会话取回成品并落盘 mp4 | 纯 HTTP，免签名 |
 | `doubao_accounts` | 账号池管理（list / switch 多账号切换） | — |
 | `doubao_ping` | 链路自检（登录态 + IP 风控状态） | — |
 
@@ -21,16 +21,14 @@ MCP 工具层
    │
    ├─ 对话 / 图片 ──→ 纯 HTTP 直连 doubao.com（免签名，快）
    │
-   └─ 视频 ──→ X-Bogus 签名器（headless 浏览器页面 evaluate
-              window.bdms.frontierSign，毫秒级）──→ HTTP 提交任务
-                                                        │
-                                                   轮询 async/stream
-                                                        │
-                                                   下载 mp4 落盘
+   └─ 视频 ──→ HTTP 提交（agent 通道，launch_stage=2）
+                  │
+              轮询会话消息（latest_messagelist）
+                  │
+              提取视频卡片 → 下载 mp4 落盘
 ```
 
-**浏览器只当"签名器"**（仅视频需要，常驻一个 headless 页面），不作为请求通道。
-对话/图片全程零浏览器。
+**全程零浏览器**：对话/图片/视频都不需要 Playwright（签名器已废弃，见「已知限制」）。
 
 ## 🚀 配置
 
@@ -95,13 +93,13 @@ python3 -m venv .venv
 | 文件 | 说明 |
 |---|---|
 | `direct_server.py` | MCP 服务（5 个工具 + 账号池） |
-| `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖，`generate_video` 增加 X-Bogus 签名） |
+| `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖；视频链路增加 agent 通道取回：会话轮询 + 视频卡片解析） |
 | `login.py` | 扫码登录 → 抓 `sessionid` 写账号池（本项目自有能力） |
 
 ## 🔓 独立性
 
-本项目**运行时零外部依赖**：不启动任何本地服务、不依赖 doubao2api 或 Playwright 常驻的
-请求通道（浏览器仅在视频签名时临时拉起）、不需要 API Key。
+本项目**运行时零外部依赖**：不启动任何本地服务、不依赖 doubao2api、不依赖 Playwright、
+不需要 API Key。
 
 `doubao_client.py` 中的 `doubao2api` 仅出现在**代码来源署名**（见 `NOTICE`），
 运行期不再读取它的任何文件或端口。从 doubao2api 迁来的旧账号池文件默认也不读，
@@ -109,12 +107,13 @@ python3 -m venv .venv
 
 ## ⚠️ 已知限制
 
-- **🔒 视频生成需要正式订阅（2026-10-19 定论）**：这是**账号套餐限制，不是协议或风控问题**。
+- **🔒 视频生成需要账号有创作额度（2026-10-19 定论）**：这是**账号套餐限制，不是协议或风控问题**。
   链路已完全打通 —— `content_type=2020` + `skill_type=17` + `launch_stage=2` 会被服务端正确
-  接收，agent 明确回复「正在为您生成视频…本次使用 Seedance 2.0 Mini 生成」，然后在最后的
-  **额度扣减环节**返回「当前免费体验套餐不可用于创作使用，可升级正式订阅」。
-  实测 `seedance_v2.0_mini` / `seedance_v2.0` / `seedance_v2.0_std` 三档模型与 5s/10s 两档
-  时长**全部命中**同一提示。开通入口：
+  接收，agent 回复「正在为您生成视频…」并走到**额度扣减环节**：
+  - 免费体验套餐：返回「当前免费体验套餐不可用于创作使用，可升级正式订阅」（任务不创建）；
+  - 有每日免费额度的账号（如账号池 `ipone`，Seedance 2.0 每日 10 次）：正常出片，
+    客户端轮询会话取回 mp4（详见下方「视频生成协议」）。
+  开通入口：
   `https://www.doubao.com/member/subscription?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting`
 - **不要给请求加 X-Bogus 签名**（2026-10-19 推翻旧结论）：签名器产出的签名已不被豆包认可，
   网关直接判为机器人 → `710022004`（`shark_admin` 人机验证）。**免签名反而一路通畅**。
@@ -125,21 +124,31 @@ python3 -m venv .venv
   换网络（手机热点最快）/ 在浏览器手动过一次滑块验证。对话端点基本不受影响。
 - **水印**：生图默认输出**无「豆包 AI 生成」标识**的版本（详见下方「水印机制」）。
   右下角仍会保留一个很小的「豆包」品牌标 —— 那是普通账号无法去除的部分。
-- 签名器依赖 Playwright + Chromium；**默认已不启用**（见上），对话/图片/视频都不需要。
+- 签名器（Playwright + Chromium）**默认已不启用**（见上），对话/图片/视频都不需要。
 - 抖音的 aBogus 纯 Python 算法与豆包 frontierSign **不同源**（输出格式不同），无法移植；
-  签名必须走浏览器页面 evaluate。
+  且豆包侧签名已失效，本项目不再走浏览器签名路线。
 
-## 🎬 视频生成协议（2026-10-19 逆向）
+## 🎬 视频生成协议（2026-10-19 逆向 · 全链路实测打通）
 
-端点与参数均已确认可用，**唯一缺口是付费墙**：
+提交（免签名）：
 
 ```
-POST /samantha/chat/completion?{security_params}     # 免签名！
-  messages[0].content_type = 2020# SamanthaVideoGenerationInput
-  messages[0].skill.skill_type = 17                   # SkillVideoGeneration
+POST /samantha/chat/completion?{security_params}
+  messages[0].content_type = 2020            # SamanthaVideoGenerationInput
+  messages[0].skill.skill_type = 17          # SkillVideoGeneration
   messages[0].content = {"text": "...", "video-model": ..., "video-duration": ..., "video-ratio": ...}
-  completion_option.launch_stage = 2                  # 关键
-  completion_option.memory_type = 0
+  completion_option.launch_stage = 2         # 关键：唯一能真正触发生成的档
+  completion_option.memory_type = 0          # 关键：必须保存云端，否则任务孤儿化
+```
+
+取回（成品由云端渲染完成后推送进会话）：
+
+```
+POST /alice/conversation/latest_messagelist?{security_params}
+  body: {"request_list": [{"conversation_id": "<字符串>", "message_index": 0, "count": 20}]}
+  → data.message_map → messages[].content（block 列表）
+  → block_type == 2074 → json.loads(block.content).creations[0].video
+  → video_model.video_list.video_1.main_url（base64 解码 = 720p 完整 mp4）
 ```
 
 官方参数来自 `POST /alice/slot/action_bar_v3/get_item_conf`（视频项 `item_id=45337547893174274`）：
@@ -150,16 +159,24 @@ POST /samantha/chat/completion?{security_params}     # 免签名！
 | `video-duration` | `5` / `10`（默认 10） |
 | `video-ratio` | `1:1` / `3:4` / `4:3` / `9:16` / `16:9` / `21:9` |
 
-两个反直觉的实测结论：
+五个反直觉的实测结论：
 
 1. **`launch_stage` 决定一切**：填 `1` 或 `0` 时 agent 会反复追问参数、任务永不落地
    （`query_video_gen_info` 始终 `has_generating_task:false`）；只有 `launch_stage=2`
    才会真正进入生成流程。
 2. **参数必须同时写进自然语言**：只传结构化字段时 agent 说「视频时长未指定」并反问；
    在 `text` 里写明「Seedance 2.0 Mini，时长 10 秒、比例 16:9，请直接开始生成，
-   不要再向我确认参数」后，它才回复「正在为您生成视频…」并走到扣费环节。
+   不要再向我确认参数」后，它才真正开始生成。
+3. **`memory_type` 必须为 `0`**：阅后即焚（`2`）的会话不落库 → 成品推送无处落地 →
+   任务孤儿化（线程列表不出现、`query_video_gen_info` 无记录、永远拿不到 `vid`）。
+   图片链路恰好因为去水印需求强制了 `0`，所以图片能取回而视频不能。
+4. **`conversation_id` 必须传字符串**：`latest_messagelist` 的 `request_list` 里传数字
+   会返回空；SSE 回显里的 `conversation_id` 全程是 `"0"`，真实 ID 要靠线程列表
+   （`/samantha/im/conversation/list`）对比快照发现。
+5. **`download_url` 只能拿到截断文件**：视频卡片里的 `download_url` 下载结果是残缺 mp4；
+   必须用 `video_model.video_list.video_1.main_url`（base64）才是完整的 720p h264 文件。
 
-其他已探明但**不可用于取回成品**的端点（留档避免重复踩坑）：
+其他已探明的端点（留档避免重复踩坑）：
 
 | 端点 | 结论 |
 |---|---|
@@ -167,9 +184,13 @@ POST /samantha/chat/completion?{security_params}     # 免签名！
 | `/alice/message/stream` | 同上 |
 | `/samantha/thread/get` | `404Not Found`（POST） |
 | `/samantha/im/conversation/basic_info` | `HTTP400` 空 body |
-| `/samantha/video/get_play_info` | 参数被识别（返回业务错误码而非参数错误），是**正确的取回钥匙**，但需要有效 `vid` —— 而付费墙导致任务从未创建，拿不到 vid |
-| `/samantha/im/conversation/list` | ✅ 可用，能列出全部会话（`conversation_type=5`、`message_index`、`badge_count`） |
-| `/samantha/video/query_video_gen_info` | ✅ 可用，`remain_count` / `has_generating_task` / `is_beta_user` |
+| `/samantha/video/get_play_info` | 参数被识别（返回业务错误码而非参数错误），是**正确的取回钥匙**，但需要有效 `vid` |
+| `/samantha/media/mget_play_status` | 同上，按 `vid` 查询播放状态 |
+| `/alice/message/content`、`/samantha/aispace/message_node_info` | 按 msg_id 取内容/节点，均未返回有效数据 |
+| `/chat/async/chunk_stream` | 要 `taskId` 驼峰字段（传 message_id 报 "req taskId is empty"） |
+| `/samantha/im/conversation/list` | ✅ 可用（POST，body `{}`），列出全部会话（`conversation_type=5`、`message_index`、`badge_count`） |
+| `/samantha/video/query_video_gen_info` | ✅ 可用（POST，body `{}`），`remain_count` / `has_generating_task` / `is_beta_user` |
+| `/alice/conversation/latest_messagelist` | ✅ 可用，取回成品的钥匙（见上） |
 
 **会话续接（`client_meta`）走不通**：7 种结构变体（官方全字段 / 去掉 `local_permissions` /
 去掉 `bot_id` / 只传 conv+sec / 旧格式 `section_id` / `last_message_index+1` / 空对象）
@@ -202,8 +223,9 @@ POST /samantha/chat/completion?{security_params}     # 免签名！
 - 对话：`POST /chat/completion`（新版端点，免签名），payload 为 `client_meta/messages[].content_block[{block_type:10000,text_block}]/option/ext` 结构，**必须带 `Agw-Js-Conv: str` 头**。
 - 上传图片：`POST /samantha/pages/upload_image` → 拿 uri → `POST /alice/message/get_file_url` 换 CDN 链接。
 - 文生图：`/samantha/chat/completion` + `content_type:2009` + `skill_type:3`（免签名）。
-- 图生视频：`/samantha/chat/completion` + `content_type:2020` + `skill_type:17` + `X-Bogus` 签名，
-  响应 SSE 提取 `fin_reason.async_task.id` → 轮询 `/samantha/chat/async/stream`。
+- 图生视频：`/samantha/chat/completion` + `content_type=2020` + `skill_type=17`（免签名），
+  `launch_stage=2` + `memory_type=0` 提交 → 轮询 `/alice/conversation/latest_messagelist`
+  取视频卡片（详见上方「视频生成协议」）。
 - 水印相关：`POST /creativity/user_config/{get,set}`（开关）、
   `POST /alice/resource/watermark_download`（换下载模板）、
   `POST /creativity/resource/get_without_watermark`（无水印资源判定）。
@@ -216,7 +238,7 @@ POST /samantha/chat/completion?{security_params}     # 免签名！
 
 `doubao_client.py` 是从 **[doubao2api](https://github.com/SeiShonagon520/doubao2api)**
 （Apache 2.0）的 `client.py` vendored 并改造而来 —— 修复了 `upload_image` 的 `NameError`、
-内联了相对导入、新增 X-Bogus 签名器。逐条改动见 `NOTICE`。
+内联了相对导入、重写了视频链路（agent 通道提交 + 会话轮询取回）。逐条改动见 `NOTICE`。
 
 思路参考 [web-ai-mcp](https://github.com/983033995/web-ai-mcp)（DeepSeek 网页版接入 MCP）。
 豆包网页版协议为逆向所得，仅供个人学习研究。
