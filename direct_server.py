@@ -1,0 +1,240 @@
+#!/usr/bin/env python3
+"""
+doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 图生视频优先）
+
+架构（逐层实验验证）：
+  - 对话 / 图片上传 / 文生图：纯 HTTP 直连，无需签名
+  - 图生视频：需 X-Bogus 签名 → 签名器常驻一个 headless 浏览器页面
+    evaluate window.bdms.frontierSign() 拿签名（毫秒级）。浏览器只当
+    "签名器"，不作为请求通道；对话/图片全程无浏览器。
+  - 多账号：账号池轮换 + 手动切换
+
+凭证配置（二选一）：
+  1. 环境变量 DOUBAO_ACCOUNTS = "名字1:cookie串1;名字2:cookie串2"
+     （cookie 串为 k=v,k=v 形式，至少含 sessionid=xxx）
+  2. 账号池文件 DOUBAO_ACCOUNTS_FILE（默认 ~/.doubao_browser/accounts.json，
+     doubao2api 扫码登录后自动生成，直接兼容）
+
+依赖：aiohttp / httpx / mcp(<2) / playwright（仅视频签名用）
+"""
+
+import asyncio
+import json
+import os
+import time
+from pathlib import Path
+
+import httpx
+from mcp.server.fastmcp import FastMCP
+
+from doubao_client import (
+    DoubaoChatClient,
+    DoubaoChatError,
+    DoubaoRateLimitError,
+)
+
+mcp = FastMCP("doubao-web")
+
+OUT_DIR = Path(os.environ.get("DOUBAO_OUT_DIR", "~/Downloads/豆包输出")).expanduser()
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+DEFAULT_DEVICE_ID = "714003710229497"
+DEFAULT_WEB_ID = "7604137868021548590"
+DEFAULT_FP = "verify_mlcfw5f7_TPq0YmFD_NrsC_4RuQ_BJPg_M5W7i58I7wV0"
+
+
+# ---------------------------------------------------------------- 账号池
+
+def _load_accounts():
+    """加载账号池：优先环境变量 DOUBAO_ACCOUNTS，其次账号池文件。"""
+    raw = os.environ.get("DOUBAO_ACCOUNTS", "").strip()
+    accounts = []
+    if raw:
+        # "名字1:k1=v1,k2=v2;名字2:k=v"
+        for chunk in raw.split(";"):
+            chunk = chunk.strip()
+            if not chunk:
+                continue
+            if ":" in chunk:
+                name, cookie_str = chunk.split(":", 1)
+            else:
+                name, cookie_str = f"账号{len(accounts)+1}", chunk
+            cookies = {}
+            for kv in cookie_str.split(","):
+                if "=" in kv:
+                    k, v = kv.split("=", 1)
+                    cookies[k.strip()] = v.strip()
+            if cookies.get("sessionid"):
+                accounts.append({"name": name.strip(), "cookies": cookies})
+    if not accounts:
+        f = os.environ.get("DOUBAO_ACCOUNTS_FILE", "~/.doubao_browser/accounts.json")
+        p = Path(f).expanduser()
+        if p.exists():
+            try:
+                data = json.loads(p.read_text())
+                for a in data.get("accounts", []):
+                    if a.get("cookies", {}).get("sessionid"):
+                        accounts.append({"name": a.get("name", "未命名"),
+                                         "cookies": a["cookies"]})
+            except Exception:
+                pass
+    return accounts
+
+
+_ACTIVE = None
+
+
+def _pick_account():
+    accounts = _load_accounts()
+    if not accounts:
+        return None, None
+    acc = _ACTIVE or accounts[0]
+    return accounts, acc
+
+
+def _new_client(acc: dict, timeout: float = 180) -> DoubaoChatClient:
+    return DoubaoChatClient(
+        cookies=acc["cookies"], ms_token="",
+        device_id=DEFAULT_DEVICE_ID, web_id=DEFAULT_WEB_ID, fp=DEFAULT_FP,
+        timeout_seconds=timeout,
+    )
+
+
+def _fail(exc) -> str:
+    msg = str(exc)
+    if "710022002" in msg or "710022004" in msg or "访问频繁" in msg:
+        return ("🚫 豆包风控中（710022002/710022004）。这是 IP 级限流："
+                "① 等 30 分钟冷却，期间别开豆包网页版 ② 换网络（手机热点最快）"
+                "③ 在浏览器里手动完成一次滑块验证。")
+    if "710012001" in msg or "登录已过期" in msg:
+        return "⚪ 登录态过期，请更新账号 Cookie。"
+    if isinstance(exc, DoubaoRateLimitError):
+        return f"🚫 限流：{msg[:200]}"
+    return f"❌ 失败：{msg[:300]}"
+
+
+def _save(url: str, suffix: str) -> str:
+    with httpx.Client(timeout=600, follow_redirects=True, trust_env=False) as c:
+        r = c.get(url)
+        r.raise_for_status()
+    p = OUT_DIR / f"doubao_{time.strftime('%Y%m%d_%H%M%S')}{suffix}"
+    p.write_bytes(r.content)
+    return str(p)
+
+
+# ---------------------------------------------------------------- MCP 工具
+
+@mcp.tool()
+def doubao_accounts(action: str = "list", name: str = "") -> str:
+    """管理豆包账号池。action: list（列出）/ switch（切换，需 name）。
+    账号来源：环境变量 DOUBAO_ACCOUNTS 或 ~/.doubao_browser/accounts.json。"""
+    global _ACTIVE
+    accounts = _load_accounts()
+    if not accounts:
+        return ("⚪ 账号池为空。两种配置方式：\n"
+                "1) MCP 配置 env: DOUBAO_ACCOUNTS=\"名字1:sessionid=xxx;名字2:sessionid=yyy\"\n"
+                "2) 账号池文件 ~/.doubao_browser/accounts.json"
+                "（doubao2api 扫码登录后自动生成，直接兼容）")
+    if action == "switch" and name:
+        for a in accounts:
+            if a["name"] == name:
+                _ACTIVE = a
+                return f"✅ 已切换到账号：{name}"
+        return f"❌ 找不到账号「{name}」，可用：{[a['name'] for a in accounts]}"
+    cur = _ACTIVE["name"] if _ACTIVE else f"{accounts[0]['name']}（默认）"
+    lines = [f"当前账号：{cur}", "账号池："]
+    lines += [f"  - {a['name']}（sessionid: {a['cookies'].get('sessionid','')[:6]}…）"
+              for a in accounts]
+    return "\n".join(lines)
+
+
+@mcp.tool()
+async def doubao_ping() -> str:
+    """检查豆包链路：账号登录态 + IP 风控状态。任何生成前先调它。"""
+    accounts, acc = _pick_account()
+    if not acc:
+        return "⚪ 未配置账号（见 doubao_accounts 说明）"
+    try:
+        async with _new_client(acc, timeout=90) as c:
+            r = await c.chat_completion("说：好")
+        return f"✅ 账号[{acc['name']}] 链路正常（回复：{(r.text or '').strip()[:30]}）。可对话 / 生图 / 生视频。"
+    except Exception as e:
+        return f"账号[{acc['name']}] {_fail(e)}"
+
+
+@mcp.tool()
+async def doubao_chat(prompt: str, model: str = "doubao") -> str:
+    """豆包文本对话：写脚本、改稿、审片、起标题、整理资料。
+    model: doubao（快）/ doubao-think（深度思考，传 1 走思考，0 快速）。"""
+    accounts, acc = _pick_account()
+    if not acc:
+        return "⚪ 未配置账号（见 doubao_accounts 说明）"
+    try:
+        async with _new_client(acc) as c:
+            r = await c.chat_completion(prompt)
+        return r.text or "(空响应)"
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") -> str:
+    """文生图或图生图。传 image_path 即为图生图。返回本地图片路径。"""
+    accounts, acc = _pick_account()
+    if not acc:
+        return "⚪ 未配置账号（见 doubao_accounts 说明）"
+    ref_key = ""
+    try:
+        async with _new_client(acc, timeout=300) as c:
+            if image_path:
+                p = Path(image_path).expanduser()
+                if not p.exists():
+                    return f"❌ 图片不存在：{p}"
+                up = await c.upload_image(p.read_bytes(), p.name)
+                ref_key = up.get("uri", "")
+            result = await c.generate_image(prompt, ratio=ratio, ref_image_key=ref_key)
+            if not result.images:
+                return "⚠️ 未拿到图片（可能被风控，先用 doubao_ping 探测）"
+            key = result.images[0].key
+            url_info = await c.get_file_download_url(key)
+            url = url_info.get("main_url") or url_info.get("url") or ""
+            if not url:
+                return f"⚠️ 拿到图片 key 但换取下载链接失败：{key[:60]}"
+        path = _save(url, ".png")
+        return f"✅ 图片已保存：{path}"
+    except Exception as e:
+        return _fail(e)
+
+
+@mcp.tool()
+async def doubao_video(prompt: str, image_path: str = "", ratio: str = "9:16") -> str:
+    """文生视频或图生视频（核心能力，通常 1-3 分钟）。传 image_path 即为图生视频。
+    ratio: 9:16（竖屏）/ 16:9 / 1:1。首次视频调用会自动启动签名器浏览器（约5秒）。
+    返回本地 mp4 路径。"""
+    accounts, acc = _pick_account()
+    if not acc:
+        return "⚪ 未配置账号（见 doubao_accounts 说明）"
+    ref_key = ""
+    try:
+        async with _new_client(acc, timeout=400) as c:
+            if image_path:
+                p = Path(image_path).expanduser()
+                if not p.exists():
+                    return f"❌ 图片不存在：{p}"
+                up = await c.upload_image(p.read_bytes(), p.name)
+                ref_key = up.get("uri", "")
+            result = await c.generate_video(prompt, ratio=ratio, ref_image_key=ref_key)
+            if not result.videos:
+                return "⚠️ 未拿到视频（可能被风控，先用 doubao_ping 探测）"
+            v = result.videos[0]
+            url = getattr(v, "video_url", "") or getattr(v, "url", "")
+            if not url:
+                return f"⚠️ 视频结果无 URL：{vars(v) if hasattr(v, '__dict__') else v}"
+        path = _save(url, ".mp4")
+        return f"✅ 视频已保存：{path}"
+    except Exception as e:
+        return _fail(e)
+
+
+if __name__ == "__main__":
+    mcp.run()
