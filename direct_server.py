@@ -24,6 +24,7 @@ doubao-web-mcp —— 豆包网页版能力接入 MCP（多账号 · 图生视�
 import asyncio
 import json
 import os
+import re
 import time
 from pathlib import Path
 
@@ -146,6 +147,57 @@ def _save(url: str, suffix: str) -> str:
     return str(p)
 
 
+def _fit_ratio(path: str, ratio: str) -> str:
+    """把已落盘的图修正到目标比例（模糊背景填充，主体完整不裁切）。
+
+    无水印通道（memory_type=0）走 agent 模式，服务端会忽略 ratio 参数，
+    出图比例随机。这里在本地补齐：背景用放大模糊的原图铺满，前景原图居中。
+    比例本来就对（或接近）时原样返回，不做任何处理。
+    """
+    if not ratio or ":" not in ratio:
+        return path
+    try:
+        tw, th = (int(x) for x in ratio.split(":", 1))
+    except Exception:
+        return path
+    target = tw / th
+    try:
+        from PIL import Image, ImageFilter, ImageEnhance
+    except ImportError:
+        return path
+    try:
+        img = Image.open(path).convert("RGB")
+    except Exception:
+        return path
+    w, h = img.size
+    if w <= 0 or h <= 0:
+        return path
+    if abs((w / h) - target) / target < 0.03:
+        return path  # 已经够接近了
+
+    # 目标画布：以原图长边为基准撑到目标比例
+    if w / h < target:      # 原图偏窄 → 加宽
+        cw, ch = int(round(h * target)), h
+    else:                   # 原图偏宽 → 加高
+        cw, ch = w, int(round(w / target))
+    cw, ch = max(cw, 1), max(ch, 1)
+
+    # 背景：cover 放大 + 模糊 + 压暗
+    scale = max(cw / w, ch / h)
+    bg = img.resize((max(int(w * scale), 1), max(int(h * scale), 1)), Image.LANCZOS)
+    bg = bg.filter(ImageFilter.GaussianBlur(radius=max(w, h) // 40))
+    bg = ImageEnhance.Brightness(bg).enhance(0.55)
+    bg = bg.crop(((bg.width - cw) // 2, (bg.height - ch) // 2,
+                  (bg.width - cw) // 2 + cw, (bg.height - ch) // 2 + ch))
+
+    # 前景：contain 原图居中
+    fscale = min(cw / w, ch / h)
+    fg = img.resize((max(int(w * fscale), 1), max(int(h * fscale), 1)), Image.LANCZOS)
+    bg.paste(fg, ((cw - fg.width) // 2, (ch - fg.height) // 2))
+    bg.save(path, quality=95)
+    return path
+
+
 # ---------------------------------------------------------------- MCP 工具
 
 @mcp.tool()
@@ -221,8 +273,13 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
             if not result.images:
                 return "⚠️ 未拿到图片（可能被风控，先用 doubao_ping 探测）"
             img = result.images[0]
-            # 结果里已自带 CDN 直链，优先用；没有才再调一次换链接口
-            url = getattr(img, "ori_url", "") or getattr(img, "raw_url", "") or ""
+            # 取链优先级：image_raw（原图无水印）> image_ori（dwm3 去水印）> 兜底换链
+            url = (
+                getattr(img, "ori_raw_url", "")
+                or getattr(img, "ori_url", "")
+                or getattr(img, "raw_url", "")
+                or ""
+            )
             if not url:
                 info = await c.get_file_download_url(img.key)
                 # 该接口在不同版本返回 dict 或 str，两种都兼容
@@ -231,6 +288,7 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
             if not url:
                 return f"⚠️ 拿到图片 key 但换取下载链接失败：{img.key[:60]}"
         path = _save(url, ".png")
+        path = _fit_ratio(path, ratio)
         return f"✅ 图片已保存：{path}"
     except Exception as e:
         return _fail(e)
