@@ -301,17 +301,21 @@ async def doubao_video(
     ratio: str = "9:16",
     video_model: str = "seedance_v2.0_mini",
     duration: int = 10,
+    wait: int = 600,
 ) -> str:
     """文生视频 / 图生视频（Seedance）。传 image_path 即为图生视频。
 
     ratio: 9:16（竖屏）/ 16:9 / 1:1 / 21:9
     video_model: seedance_v2.0_mini（默认，1x）/ seedance_v2.0（Fast）/ seedance_v2.0_std（2x）
     duration: 5 或 10秒
+    wait: 等待成品的秒数（默认 600=10 分钟，与官方预计等待时间匹配）；
+          传 0 = 只提交任务，立即返回会话链接。
 
-    🔒 已知限制（2026-10-19 实测）：豆包视频生成需要**正式订阅**，
-    免费体验套餐会在最后的额度扣减环节被拦（agent 回复
-    「当前免费体验套餐不可用于创作使用」）。协议链路本身已打通，
-    开通后即可直接返回 mp4 路径。开通入口见返回文案。
+    🔒 账号额度说明（2026-10-19 实测）：视频生成走 agent 通道、异步渲染。
+    需要账号有视频创作额度——免费体验套餐会在扣费环节被拦
+    （「当前免费体验套餐不可用于创作使用」）；有每日免费额度的账号
+    （如账号池 ipone，Seedance 2.0 每日 10 次）可正常出片。
+    额度查询与账号切换见 doubao_accounts。
     """
     accounts, acc = _pick_account()
     if not acc:
@@ -331,30 +335,40 @@ async def doubao_video(
                 ref_image_key=ref_key,
                 video_model=video_model,
                 video_duration=duration,
+                poll_timeout=max(0, wait),
             )
 
-            # 直返 mp4（服务端偶发同步返回时）
+            # 成品到手（轮询会话取回 or 服务端偶发同步返回）
             if result.videos:
                 v = result.videos[0]
                 url = getattr(v, "video_url", "") or getattr(v, "url", "")
                 if url:
                     path = _save(url, ".mp4")
-                    return f"✅ 视频已保存：{path}"
+                    extra = f"\n   vid：{v.vid}" if getattr(v, "vid", "") else ""
+                    return f"✅ 视频已保存：{path}{extra}"
 
             reply = getattr(result, "agent_reply", "") or ""
 
-            # 🔴 付费墙判定（2026-10-19 实测四种模型/时长组合均命中）
-            # 参数齐全后 agent 才会走到扣费环节，此时返回订阅提示。
-            # 这不是协议/风控问题，纯账号套餐限制。
-            if "免费体验套餐" in reply or "升级正式订阅" in reply:
+            # 🔴 付费墙判定：套餐无视频创作额度（账号问题，非协议问题）
+            if "免费体验套餐" in reply or "升级正式订阅" in reply or "不可用于创作" in reply:
                 return (
-                    "🔒 豆包视频生成需要正式订阅（当前账号是免费体验套餐）。\n"
+                    "🔒 当前账号（"
+                    + acc.get("name", "?")
+                    + "）无视频创作额度：免费体验套餐不可用于创作使用。\n"
                     "   已确认这不是协议或风控问题：链路完全打通，模型/时长/比例参数\n"
                     "   均被服务端正确接收，卡在最后的额度扣减环节。\n"
                     f"   豆包提示：{reply[:120]}\n"
-                    "   开通入口：https://www.doubao.com/member/subscription"
-                    "?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting\n"
-                    "   开通后本工具即可直接返回 mp4 路径。"
+                    "   解决：切换有每日免费额度的账号（doubao_accounts），\n"
+                    "   或开通正式订阅：https://www.doubao.com/member/subscription"
+                    "?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting"
+                )
+
+            # 风控拦截
+            if "710022004" in reply or "风控" in reply:
+                return (
+                    "🚫 请求被豆包风控拦截（710022004）。\n"
+                    f"   {reply[:200]}\n"
+                    "   建议：稍后重试，或更换网络环境后重试。"
                 )
 
             # 参数没被识别 —— agent 在追问，需要把参数写进自然语言

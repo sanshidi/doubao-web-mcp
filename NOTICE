@@ -18,14 +18,21 @@ Copyright 2026 sanshidi
 2. **内联相对导入**：`CHROMIUM_BUILD`、`iter_sse_events`、`resolve_memory_type` 三个依赖改为文件内直接定义，使 `doubao_client.py` 可作为独立模块运行，无需 doubao2api 包结构。
 3. **新增签名器能力（2026-10-19 已默认停用）**：新增 `_signed_url()` 方法与 `_XSigner` 类。`_XSigner` 常驻一个 headless Chromium 页面，通过 `evaluate()` 调用豆包页面内的 `window.bdms.frontierSign(query_string)` 生成 `X-Bogus` 签名。
    **实测结论：加签名反而触发风控** —— 同一账号同一端点，普通对话带签名返回 `710022004`（`shark_admin` 人机验证），免签名正常返回。故 `_signed_url()` 默认走免签名（新增 `force_x_bogus=True` 可强制启用，仅供回滚与对照实验）；`generate_video()` 改用新增的 `_plain_url()`。
-4. **新增视频链路逆向成果（2026-10-19）**：
+4. **新增视频链路逆向成果（2026-10-19，全链路实测打通）**：
    - 官方参数来自 `POST /alice/slot/action_bar_v3/get_item_conf`（视频项 `item_id=45337547893174274`）：
      `video-model` / `video-duration` / `video-ratio`，以及 `reply_message_format = "帮我生成一个视频：%s"`。
    - `completion_option.launch_stage` 必须为 `2` 才会真正进入生成；`1`/`0` 时 agent 反复追问参数、任务不落地。
    - 参数必须同时写进 `content.text` 自然语言，否则 agent 回应「时长未指定」并反问。
+   - `completion_option.memory_type` 必须为 `0`（保存云端）：阅后即焚（`2`）的会话不落库，
+     成品推送无处落地，任务孤儿化（线程列表不出现、`query_video_gen_info` 无记录）。
    - 新增 `_parse_sse_agent_meta()`：豆包 SSE 是**双层转义 JSON**，正则会被转义层挡住，改为逐层 `json.loads` 正规解析。
+   - 新增会话轮询取回：`POST /alice/conversation/latest_messagelist`
+     （`request_list[].conversation_id` 必须传**字符串**）→ 找 `block_type=2074` 的 creations 视频卡片
+     → `video_model.video_list.video_1.main_url`（base64）即 720p 完整 mp4；
+     卡片里的 `download_url` 只能拿到截断文件，仅作兜底。
    - `VideoGenerationResult` 新增 `conversation_id` / `agent_reply` / `task_id` 字段。
-   - 最终结论：视频卡在**付费墙**（免费体验套餐不可用于创作使用），非协议问题。详见 README「视频生成协议」章节。
+   - 额度结论：免费体验套餐在扣费环节被拦（「不可用于创作使用」）；有每日免费额度的账号
+     （如 ipone，Seedance 2.0 每日 10 次）可正常出片。详见 README「视频生成协议」章节。
 5. **降级** `captcha_handler` 为 no-op（原实现依赖 doubao2api 的浏览器上下文）。
 6. 移除对 doubao2api 会话文件格式的运行期依赖：凭证改由本项目自带的 `login.py` 抓取，
    写入 `~/.doubao-mcp/accounts.json`（原实现读 `~/.doubao_browser/accounts.json`）。
