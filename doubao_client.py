@@ -17,7 +17,7 @@ import uuid
 import zlib
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Union
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Dict, Iterator, List, Optional, Tuple, Union
 from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 import aiohttp
@@ -359,9 +359,22 @@ class GeneratedVideo:
 
 @dataclass
 class VideoGenerationResult:
-    """Result of a video generation call."""
+    """Result of a video generation call.
+
+    🔴 2026-10-19：豆包视频实际是**异步**的，且请求会被降级为 agent 对话。
+    即使 ``launch_stage=2`` 触发了 Seedance，响应里也只有 agent 文本
+    （「本次使用 Seedance 2.0 Mini 生成，预计等待 10 分钟…」），
+    没有 task_id / vid / mp4。成品由云端渲染完成后推送到会话。
+
+    因此新增两个字段承载"任务已提交"的证据，供上层回传给用户：
+      conversation_id: 任务所在会话
+      agent_reply:豆包 agent 的原始回复文本
+    """
     videos: List[GeneratedVideo] = field(default_factory=list)
     prompt: str = ""
+    conversation_id: str = ""
+    agent_reply: str = ""
+    task_id: str = ""
 
 
 @dataclass
@@ -1788,6 +1801,9 @@ class DoubaoChatClient:
         timeout: float = 300,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
+        video_model: str = "seedance_v2.0_mini",
+        video_duration: int = 10,
+        launch_stage: int = 2,
     ) -> "VideoGenerationResult":
         """Generate video using Doubao's AI video generation.
 
@@ -1806,13 +1822,43 @@ class DoubaoChatClient:
             timeout: Max seconds to wait for video generation (default 300).
             memory_type: Optional 0 (save to web history) or 2 (ephemeral).
             save_history: If True, sets memory_type=0.
+            video_model: 官方 model key，三档（来自 /alice/slot/action_bar_v3/get_item_conf）：
+                - ``seedance_v2.0_mini``（默认，日常生成，1x 消耗）
+                - ``seedance_v2.0``（2.0 Fast，快速出片）
+                - ``seedance_v2.0_std``（2.0，进阶画面表现，2x 消耗）
+            video_duration: 官方时长档，只支持 5 / 10（默认 10）。
+            launch_stage: ``2``= 直接进入生成（实测唯一能真正触发 Seedance 的档）；
+                ``1``/``0`` 会降级为 agent 反复追问参数、任务不落地。
 
         Returns:
             VideoGenerationResult with list of generated videos.
         """
-        content_dict: Dict[str, Any] = {"text": prompt}
+        model_label = {
+            "seedance_v2.0_mini": "Seedance 2.0 Mini",
+            "seedance_v2.0": "Seedance 2.0 Fast",
+            "seedance_v2.0_std": "Seedance 2.0",
+        }.get(video_model, video_model)
+        ratio_text = f"、比例 {ratio}" if ratio else ""
+
+        # 官方 reply_message_format（见 /alice/slot/action_bar_v3/get_item_conf
+        #   → input_box_content.reply_message_format = "帮我生成一个视频：%s"）
+        #
+        # 🔴 2026-10-19 实测结论：把 selector 值同时写进**自然语言**，
+        # 是唯一能让 agent 真正进入生成（而非反复追问参数）的做法。
+        # 只传结构化字段时 agent 会说「时长未指定」并反问；
+        # 写进文本后它直接回「我先按默认方案生成：10 秒、16:9…本次使用
+        # Seedance 2.0 Mini 生成」。结构化字段一并保留，两条路都走。
+        content_dict: Dict[str, Any] = {
+            "text": (
+                f"帮我生成一个视频：{prompt}\n"
+                f"参数：{model_label}，时长 {video_duration} 秒{ratio_text}。"
+                f"请直接开始生成，不要再向我确认参数。"
+            ),
+            "video-model": video_model,
+            "video-duration": str(video_duration),
+        }
         if ratio:
-            content_dict["ratio"] = ratio
+            content_dict["video-ratio"] = ratio
         if camera_movement:
             content_dict["camera_movement"] = camera_movement
 
@@ -1848,7 +1894,7 @@ class DoubaoChatClient:
                 "is_regen": False,
                 "with_suggest": True,
                 "need_create_conversation": True,
-                "launch_stage": 1,
+                "launch_stage": launch_stage,
                 "is_replace": False,
                 "is_delete": False,
                 "is_ai_playground": False,
@@ -1873,11 +1919,13 @@ class DoubaoChatClient:
         }
 
         # Phase 1: Submit video generation request
+        # launch_stage=2 会让 agent 走完整推理链路再回复，实测 60s 不够，
+        # 这里给足 180s（sock_read 由 session 级 timeout 控制）。
         async with self.session.post(
             url,
             data=json.dumps(sent_event, ensure_ascii=False),
             headers=headers,
-            timeout=aiohttp.ClientTimeout(total=60),
+            timeout=aiohttp.ClientTimeout(total=180),
         ) as resp:
             if resp.status != 200:
                 error_text = await resp.text()
@@ -1914,10 +1962,59 @@ class DoubaoChatClient:
                     "generate_video: 服务过载，请稍后重试"
                 )
             # Try parsing as sync response (content_type=2021)
-            return self._parse_video_sse(raw, prompt)
+            result = self._parse_video_sse(raw, prompt)
+
+            # 异步/agent 通道：把会话与agent 回复带出去，供上层告知用户去哪取成品
+            conv_id, agent_text = self._parse_sse_agent_meta(raw)
+            result.conversation_id = conv_id
+            result.agent_reply = agent_text
+            result.prompt = prompt
+            return result
 
         # Phase 2: Poll /samantha/chat/async/stream for video result
         return await self._poll_async_video(task_id, prompt, timeout)
+
+    @staticmethod
+    def _parse_sse_agent_meta(raw: str) -> Tuple[str, str]:
+        """从 SSE 响应提取 (conversation_id, agent 回复文本)。
+
+        豆包的 SSE 是**双层转义** JSON：外层 event_data 是字符串，
+        里面的字段又带一层 \\" 转义。正则很容易被这层转义挡住
+        （``"tts_content":"..."`` 实际是 ``\\"tts_content\\":\\"...``），
+        所以这里逐层 json.loads 正规解析，不用正则。
+        """
+        conv_id = ""
+        agent_text = ""
+        for block in raw.split("\n\n"):
+            if not block.strip():
+                continue
+            for line in block.strip().split("\n"):
+                if not line.startswith("data:"):
+                    continue
+                try:
+                    outer = json.loads(line[5:].strip())
+                except json.JSONDecodeError:
+                    continue
+                if outer.get("event_type") != 2001:
+                    continue
+                ed = outer.get("event_data")
+                if isinstance(ed, str):
+                    try:
+                        ed = json.loads(ed)
+                    except json.JSONDecodeError:
+                        continue
+                if not isinstance(ed, dict):
+                    continue
+                # 首个 echo 事件的 conversation_id 可能是 "0"（尚未建会话），
+                # 只接受真实长数字 ID
+                cid = ed.get("conversation_id")
+                if cid and str(cid).isdigit() and len(str(cid)) >= 15:
+                    conv_id = str(cid)
+                # tts_content 是增量分片的，拼接才是完整回复
+                tts = ed.get("tts_content")
+                if tts:
+                    agent_text += tts
+        return conv_id, agent_text.strip()
 
     def _extract_async_task_id(self, raw: str) -> Optional[str]:
         """Extract async task_id from SSE response (fin_reason.async_task.id)."""

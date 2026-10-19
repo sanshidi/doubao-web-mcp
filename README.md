@@ -109,15 +109,71 @@ python3 -m venv .venv
 
 ## ⚠️ 已知限制
 
-- **IP 风控**：视频端点（skill 17）风控阈值最高。触发 `710022002/710022004` 时：
-  等待冷却（约 30 分钟，期间别开豆包网页版）/ 换网络（手机热点最快）/
-  在浏览器手动过一次滑块验证。对话端点基本不受影响。
+- **🔒 视频生成需要正式订阅（2026-10-19 定论）**：这是**账号套餐限制，不是协议或风控问题**。
+  链路已完全打通 —— `content_type=2020` + `skill_type=17` + `launch_stage=2` 会被服务端正确
+  接收，agent 明确回复「正在为您生成视频…本次使用 Seedance 2.0 Mini 生成」，然后在最后的
+  **额度扣减环节**返回「当前免费体验套餐不可用于创作使用，可升级正式订阅」。
+  实测 `seedance_v2.0_mini` / `seedance_v2.0` / `seedance_v2.0_std` 三档模型与 5s/10s 两档
+  时长**全部命中**同一提示。开通入口：
+  `https://www.doubao.com/member/subscription?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting`
+- **不要给请求加 X-Bogus 签名**（2026-10-19 推翻旧结论）：签名器产出的签名已不被豆包认可，
+  网关直接判为机器人 → `710022004`（`shark_admin` 人机验证）。**免签名反而一路通畅**。
+  对照实验：普通对话 + 签名 → `710022004`；普通对话 + 免签名 → 正常返回。
+  旧文档曾说「视频端点风控阈值最高」，实测并非如此，而是签名本身失效。
+  代码里保留 `force_x_bogus=True` 开关仅供回滚/对照，默认 `False`。
+- **IP 风控**：触发 `710022002/710022004` 时：等待冷却（约 30 分钟，期间别开豆包网页版）/
+  换网络（手机热点最快）/ 在浏览器手动过一次滑块验证。对话端点基本不受影响。
 - **水印**：生图默认输出**无「豆包 AI 生成」标识**的版本（详见下方「水印机制」）。
   右下角仍会保留一个很小的「豆包」品牌标 —— 那是普通账号无法去除的部分。
-- **视频生成受豆包账号每日免费额度限制**。
-- 签名器依赖 Playwright + Chromium；仅视频功能需要，对话/图片不受影响。
+- 签名器依赖 Playwright + Chromium；**默认已不启用**（见上），对话/图片/视频都不需要。
 - 抖音的 aBogus 纯 Python 算法与豆包 frontierSign **不同源**（输出格式不同），无法移植；
-  签名必须走浏览器页面 evaluate（已验证 `X-Bogus` 参数名 + 16 位短签名）。
+  签名必须走浏览器页面 evaluate。
+
+## 🎬 视频生成协议（2026-10-19 逆向）
+
+端点与参数均已确认可用，**唯一缺口是付费墙**：
+
+```
+POST /samantha/chat/completion?{security_params}     # 免签名！
+  messages[0].content_type = 2020# SamanthaVideoGenerationInput
+  messages[0].skill.skill_type = 17                   # SkillVideoGeneration
+  messages[0].content = {"text": "...", "video-model": ..., "video-duration": ..., "video-ratio": ...}
+  completion_option.launch_stage = 2                  # 关键
+  completion_option.memory_type = 0
+```
+
+官方参数来自 `POST /alice/slot/action_bar_v3/get_item_conf`（视频项 `item_id=45337547893174274`）：
+
+| key | 可选值 |
+|---|---|
+| `video-model` | `seedance_v2.0_mini`（1x，默认）/ `seedance_v2.0`（Fast）/ `seedance_v2.0_std`（2x） |
+| `video-duration` | `5` / `10`（默认 10） |
+| `video-ratio` | `1:1` / `3:4` / `4:3` / `9:16` / `16:9` / `21:9` |
+
+两个反直觉的实测结论：
+
+1. **`launch_stage` 决定一切**：填 `1` 或 `0` 时 agent 会反复追问参数、任务永不落地
+   （`query_video_gen_info` 始终 `has_generating_task:false`）；只有 `launch_stage=2`
+   才会真正进入生成流程。
+2. **参数必须同时写进自然语言**：只传结构化字段时 agent 说「视频时长未指定」并反问；
+   在 `text` 里写明「Seedance 2.0 Mini，时长 10 秒、比例 16:9，请直接开始生成，
+   不要再向我确认参数」后，它才回复「正在为您生成视频…」并走到扣费环节。
+
+其他已探明但**不可用于取回成品**的端点（留档避免重复踩坑）：
+
+| 端点 | 结论 |
+|---|---|
+| `/alice/message/list/v2` | `710010202`，7 种参数组合（含 int/str 类型变化）全挂；补 `X-Csrf-Token` 也无效 |
+| `/alice/message/stream` | 同上 |
+| `/samantha/thread/get` | `404Not Found`（POST） |
+| `/samantha/im/conversation/basic_info` | `HTTP400` 空 body |
+| `/samantha/video/get_play_info` | 参数被识别（返回业务错误码而非参数错误），是**正确的取回钥匙**，但需要有效 `vid` —— 而付费墙导致任务从未创建，拿不到 vid |
+| `/samantha/im/conversation/list` | ✅ 可用，能列出全部会话（`conversation_type=5`、`message_index`、`badge_count`） |
+| `/samantha/video/query_video_gen_info` | ✅ 可用，`remain_count` / `has_generating_task` / `is_beta_user` |
+
+**会话续接（`client_meta`）走不通**：7 种结构变体（官方全字段 / 去掉 `local_permissions` /
+去掉 `bot_id` / 只传 conv+sec / 旧格式 `section_id` / `last_message_index+1` / 空对象）
+**全部返回 `710020702`**，且第2 轮请求不会在服务端创建可复用会话，对话实际无法续接。
 
 ## 🔏 水印机制（2026-10-19 逆向 + A/B 实测）
 
