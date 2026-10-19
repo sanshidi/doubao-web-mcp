@@ -12,6 +12,7 @@ import hmac as hmac_mod
 import json
 import logging
 import os
+import re
 import uuid
 import zlib
 from dataclasses import dataclass, field
@@ -275,19 +276,32 @@ class CompletionResult:
 class GeneratedImage:
     """A single generated image from the image generation API.
 
-    Note: All URLs contain watermarks applied at CDN level (ImageX tplv templates).
-    This is enforced server-side and cannot be bypassed — URL signatures are bound
-    to the full path including the watermark template.
+    Watermark note (updated 2026-10-19, verified by A/B test):
+    The server renders watermarks at the CDN (ImageX) level via tplv templates.
+    The template suffix decides whether a watermark is burned in:
+
+        ~tplv-*-cgen_lwm3 / cthumb_lwm3   → HAS "豆包 AI 生成" watermark
+        ~tplv-*-cgen_dwm3 / cthumb_dwm3   → watermark removed ("d" = 去水印)
+        ~tplv-*-image_raw                 → original asset, NO watermark
+
+    Which family the server sends depends on `memory_type`:
+        memory_type=2 (ephemeral)   → lwm3 (watermarked)
+        memory_type=0 (saved)       → dwm3 / image_raw (watermark-free)
+
+    Signatures cover the whole path including the template, so you cannot
+    hand-edit lwm3 → dwm3; the server must hand out the free URL itself.
 
     Fields:
-        ori_url: "download" quality, ~tplv-*-image_dld_watermark (largest, has watermark)
-        raw_url: "preview" quality, ~tplv-*-image_pre_watermark (has watermark)
-        thumb_url: thumbnail with watermark (smallest)
+        ori_url: "download" quality, ~tplv-*-cgen_dwm3 (or lwm3 if watermarked)
+        raw_url: "preview" quality, ~tplv-*-cthumb_dwm3
+        thumb_url: thumbnail
+        ori_raw_url: ~tplv-*-image_raw — watermark-free original, best pick
     """
     key: str = ""
     thumb_url: str = ""
     ori_url: str = ""
     raw_url: str = ""
+    ori_raw_url: str = ""
     width: int = 0
     height: int = 0
     format: str = ""
@@ -298,6 +312,39 @@ class ImageGenerationResult:
     """Result of an image generation call."""
     images: List[GeneratedImage] = field(default_factory=list)
     prompt: str = ""
+
+
+def _extract_watermark_free_urls(raw: str) -> Dict[str, str]:
+    """从生图 SSE 原文里捞出「无水印」模板的 CDN 直链。
+
+    ImageX 的 tplv 模板后缀决定是否把「豆包 AI 生成」烧进画面（已 A/B 实测）：
+
+        ~tplv-*-cgen_lwm3 / cthumb_lwm3  → 带水印
+        ~tplv-*-cgen_dwm3 / cthumb_dwm3  → 去水印
+        ~tplv-*-image_raw                → 原始图，无水印
+
+    服务端只在 memory_type=0（保存到历史）时才下发 dwm3 / image_raw，
+    阅后即焚(memory_type=2)只给 lwm3。签名覆盖整个 path 含模板，
+    所以不能手工把 lwm3 改成 dwm3（会 400），只能让服务端自己给。
+
+    Returns:
+        {"image_raw": url, "dwm3": url}（只含存在的键）
+    """
+    if not raw:
+        return {}
+    s = raw.replace("\\\\u0026", "&").replace("\\u0026", "&")
+    s = s.replace("\\\\/", "/").replace("\\/", "/")
+    s = s.replace("\\\\", "").replace("\\", "")
+    out: Dict[str, str] = {}
+    for m in re.finditer(r'https://[^\s"<>]+rc_gen_image[^\s"<>]+', s):
+        u = m.group(0)
+        if "~tplv-" not in u:
+            continue
+        if "-image_raw." in u:
+            out.setdefault("image_raw", u)
+        elif "-dwm3." in u:
+            out.setdefault("dwm3", u)
+    return out
 
 
 @dataclass
@@ -1525,6 +1572,7 @@ class DoubaoChatClient:
         timeout: float = 120,
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
+        no_watermark: bool = True,
     ) -> "ImageGenerationResult":
         """Generate images using Doubao's AI image generation.
 
@@ -1578,6 +1626,10 @@ class DoubaoChatClient:
             )
 
         eff_mem_type = resolve_memory_type(memory_type, save_history)
+        if no_watermark and memory_type is None and save_history is None:
+            # 服务端只有在「保存到云端历史」时才下发去水印模板
+            # (cgen_dwm3 / image_raw)；阅后即焚(memory_type=2)只会给 lwm3 带水印版。
+            eff_mem_type = 0
         sent_event: Dict[str, Any] = {
             "messages": [message],
             "completion_option": {
@@ -1676,11 +1728,26 @@ class DoubaoChatClient:
                     thumb_url=thumb.get("url", ""),
                     ori_url=ori.get("url", ""),
                     raw_url=raw.get("url", ""),
+                    ori_raw_url=(item.get("image_ori_raw", {}) or {}).get("url", ""),
                     width=ori.get("width", 0) or thumb.get("width", 0),
                     height=ori.get("height", 0) or thumb.get("height", 0),
                     format=ori.get("format", "") or thumb.get("format", ""),
                 )
                 result.images.append(img)
+
+        # 全文扫描兜底：生图事件结构随版本变动（2010 / 2074 等），
+        # 直接从 SSE 原文里捞无水印模板 URL，最稳。
+        wm_urls = _extract_watermark_free_urls(raw)
+        if wm_urls:
+            if not result.images:
+                result.images.append(GeneratedImage())
+            first = result.images[0]
+            if wm_urls.get("image_raw"):
+                first.ori_raw_url = wm_urls["image_raw"]
+            if wm_urls.get("dwm3") and not first.ori_url:
+                first.ori_url = wm_urls["dwm3"]
+            if wm_urls.get("dwm3") and not first.raw_url:
+                first.raw_url = wm_urls["dwm3"]
 
         return result
 

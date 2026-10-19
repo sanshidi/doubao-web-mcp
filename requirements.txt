@@ -5,6 +5,9 @@ mcp[cli]>=1.9,<2
 # HTTP 直连层（对话 / 生图 / 图生视频 / 上传）
 httpx>=0.27
 
+# 无水印出图后按目标比例做模糊背景填充（主体完整不裁切）
+pillow>=10.0
+
 # 仅视频签名器需要：常驻 headless 页面调用 window.bdms.frontierSign
 # 安装后需执行：playwright install chromium
 playwright>=1.40
