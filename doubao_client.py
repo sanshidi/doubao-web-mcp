@@ -514,6 +514,7 @@ class DoubaoChatClient:
         timeout_seconds: int = 120,
         captcha_handler: Union[None, str, "CaptchaHandler"] = "auto",
         max_captcha_retries: int = 3,
+        force_x_bogus: bool = False,
     ) -> None:
         """
         Args:
@@ -525,6 +526,10 @@ class DoubaoChatClient:
                 A custom ``CaptchaHandler`` instance — used as-is.
             max_captcha_retries: Maximum number of automatic captcha retries
                 before giving up and raising ``DoubaoRateLimitError``.
+            force_x_bogus:
+                🔴 2026-10-19 起默认 **False**。实测加 X-Bogus 签名会稳定触发
+                ``710022004``（shark_admin 人机验证），免签名反而一路通畅。
+                保留此开关仅为对照实验/未来签名器修复后回滚用。
         """
         if not cookies:
             raise ValueError("cookies are required")
@@ -536,6 +541,7 @@ class DoubaoChatClient:
         self.fp = fp
         self.bot_id = bot_id
         self.max_captcha_retries = max_captcha_retries
+        self.force_x_bogus = force_x_bogus
         # Use sock_read for SSE streams (reset on each chunk/heartbeat).
         # total=None avoids cutting off long expert-mode responses that
         # can exceed 3-4 minutes with multiple search rounds.
@@ -640,11 +646,32 @@ class DoubaoChatClient:
         return params
 
     async def _signed_url(self, path: str) -> str:
-        """构造带 X-Bogus 签名的 URL（签名器：常驻 headless 浏览器页面）。"""
+        """构造请求 URL。
+
+        🔴 2026-10-19 重大更正：X-Bogus 签名已失效，加签名反而触发风控。
+
+        对照实验（同一账号、同一端点 /samantha/chat/completion）：
+
+        | 请求               | 结果                                   |
+        |--------------------|----------------------------------------|
+        | 普通对话 + 签名    | 710022004 rate limited（shark_admin 人机验证）|
+        | 普通对话 + 免签名  | ✅ 正常返回「你好😊」                    |
+        | 生图 (skill 5) + 签名 | 710022004 rate limited              |
+        | 视频 (skill 17) + 签名 | 710022004 rate limited              |
+
+        结论：签名器产出的 X-Bogus 已不被豆包认可，网关把它判为机器人请求。
+        本方法保留为**可选强制签名**入口，默认走免签名。
+        """
         params = self._security_params()
         qs = urlencode(dict(sorted(params.items())))
+        if not self.force_x_bogus:
+            return f"{self.BASE_URL}{path}?{qs}"
         sig = await _get_signer().sign(qs, self.cookies)
         return f"{self.BASE_URL}{path}?{qs}" + (f"&X-Bogus={sig}" if sig else "")
+
+    def _plain_url(self, path: str) -> str:
+        """构造免签名 URL（当前唯一稳定可用的方式）。"""
+        return f"{self.BASE_URL}{path}?{urlencode(self._security_params())}"
 
     @staticmethod
     def _encode_payload(obj: Dict[str, Any]) -> str:
@@ -1838,7 +1865,7 @@ class DoubaoChatClient:
             "local_message_id": str(uuid.uuid4()),
         }
 
-        url = await self._signed_url("/samantha/chat/completion")
+        url = self._plain_url("/samantha/chat/completion")
         headers = {
             "Accept": "text/event-stream",
             "Content-Type": "application/json",
