@@ -36,6 +36,69 @@ CHROME_VERSION = "148.0.0.0"
 CHROMIUM_BUILD = "148.0.7816.0"
 
 
+# ---- 官方创作模型清单（2026-10-19 抓包自 /alice/slot/action_bar_v3/get_item_conf） ----
+# 图片项 item_id=45033999706177282，「模型」选择器 selector id=30；
+# 视频项 item_id=45337547893174274，「模型」选择器 selector id=6。
+# option_key 即前端写入消息 content 的值（图片走 "image-model"，视频走 "video-model"）。
+
+IMAGE_MODELS: Dict[str, Dict[str, Any]] = {
+    "Seedream 5.0 Flash": {"id": 6, "sub": "专业快速", "need_upgrade": False},
+    "Seedream 5.0 Pro": {"id": 5, "sub": "专业出图・4 倍消耗", "need_upgrade": True},
+    "Seedream 4.5": {"id": 3, "sub": "日常生成", "need_upgrade": False},
+    "Seedream 4.0": {"id": 1, "sub": "基础生图", "need_upgrade": False},
+}
+
+VIDEO_MODELS: Dict[str, Dict[str, Any]] = {
+    "seedance_v2.5": {"id": 7, "display": "Seedance 2.5",
+                      "sub": "旗舰视频标杆・5 倍消耗", "need_upgrade": True},
+    "seedance_v2.0_std": {"id": 5, "display": "Seedance 2.0",
+                          "sub": "进阶画面表现・2 倍消耗", "need_upgrade": True},
+    "seedance_v2.0": {"id": 4, "display": "Seedance 2.0 Fast",
+                      "sub": "快速出片选择", "need_upgrade": False},
+    "seedance_v2.0_mini": {"id": 6, "display": "Seedance 2.0 Mini",
+                           "sub": "日常生成使用", "need_upgrade": False},
+}
+
+# 官方「风格」选择器 selector id=4 的 option_key → 显示名（message_text = "图片风格为{显示名}"）
+IMAGE_STYLES: Dict[str, str] = {
+    "skill_image_styles_portrait": "人像摄影",
+    "skill_image_styles_film": "电影写真",
+    "skill_image_styles_chinese": "中国风",
+    "skill_image_styles_japanese_anime": "动漫",
+    "skill_image_styles_3d": "3D渲染",
+    "image_gen_style_cyberpunk": "赛博朋克",
+    "skill_image_styles_cg": "CG 动画",
+    "skill_image_styles_ink_wash_painting": "水墨画",
+    "skill_image_styles_oil_painting": "油画",
+    "skill_image_styles_classic": "古典",
+    "skill_image_styles_watercolor": "水彩画",
+    "skill_image_styles_cartoon": "卡通",
+    "skill_image_styles_flat_illustration": "平面插画",
+    "skill_image_styles_landscape": "风景",
+    "skill_image_styles_hongkong_anime": "港风动漫",
+    "skill_image_styles_pixel_style": "像素风格",
+    "skill_image_styles_fluorescence": "荧光绘画",
+    "skill_image_styles_colored_pencil": "彩铅画",
+    "skill_image_styles_figure": "手办",
+    "skill_image_styles_children_illustration": "儿童绘画",
+    "skill_image_styles_abstract": "抽象",
+    "skill_image_styles_sharp_illustration": "锐笔插画",
+    "skill_image_styles_acg": "二次元",
+    "skill_image_styles_ink_print": "油墨印刷",
+    "skill_image_styles_bnw_printing": "版画",
+    "skill_image_styles_monet": "莫奈",
+    "skill_image_styles_picasso": "毕加索",
+    "skill_image_styles_rembrandt": "伦勃朗",
+    "skill_image_styles_matisse": "马蒂斯",
+    "skill_image_styles_baroque": "巴洛克",
+    "skill_image_styles_oldschool": "复古动漫",
+    "skill_image_styles_picturebook": "绘本",
+}
+
+# 兼容 generate_image 里的注入写法
+IMAGE_STYLE_LABELS = IMAGE_STYLES
+
+
 # ---- vendored (was: from .sse import iter_sse_events) ----
 async def iter_sse_events(content: Any) -> AsyncIterator[Dict[str, Any]]:
     """Parse SSE stream from aiohttp response.content."""
@@ -314,6 +377,8 @@ class ImageGenerationResult:
     """Result of an image generation call."""
     images: List[GeneratedImage] = field(default_factory=list)
     prompt: str = ""
+    notice: str = ""  # 付费墙/风控等服务端提示（如「订阅标准套餐专属能力」）
+    model: str = ""   # 实际生效的模型（新协议从响应回显确认）
 
 
 def _extract_watermark_free_urls(raw: str) -> Dict[str, str]:
@@ -379,6 +444,7 @@ class VideoGenerationResult:
     conversation_id: str = ""
     agent_reply: str = ""
     task_id: str = ""
+    model: str = ""  # 新协议实际生效的模型（旧 agent 通道留空）
 
 
 @dataclass
@@ -1607,6 +1673,496 @@ class DoubaoChatClient:
             log.warning("delete_conversation %s failed: %s", conversation_id, exc)
             return False
 
+    # ---- 新统一端点协议（2026-10-19 抓包地面真值） ----
+    # 真实前端走 POST /chat/completion（免签名；浏览器自带 a_bogus 反而触发 710022004），
+    # 模型/比例/风格选择挂在 chat_ability.ability_param 里，与 samantha 的 skill content
+    # 字典是两套协议。samantha 格式会把 content 剥成纯文本走 agent 通道，模型选择被忽略
+    # （实测：image-model 键不被解析；视频的 video-model 同样可能被忽略）。
+
+    def _new_endpoint_params(self) -> Dict[str, str]:
+        """新端点 /chat/completion 的安全参数（抓包自真实前端，aid=497858）。"""
+        return {
+            "aid": "497858", "real_aid": "497858",
+            "device_id": "7698374278500353570",
+            "tea_uuid": "7698374278500353570",
+            "web_id": "7698374278500353570",
+            "device_platform": "web",
+            "doubao_device_platform": "web",
+            "doubao_pc_version": "3.41.4",
+            "language": "zh", "region": "CN", "sys_region": "CN",
+            "pkg_type": "release_version", "version_code": "20800",
+            "pc_version": "3.41.4",
+            "chromium_version": CHROMIUM_BUILD,
+            "client_platform": "pc_client", "runtime": "web",
+            "runtime_version": "3.5.4", "samantha_web": "1",
+            "use-olympus-account": "1",
+            "fp": "verify_mvfb2gzc_nST1AVAS_3Mpe_4uAR_8WAF_mxtjs",
+            "web_tab_id": str(uuid.uuid4()),
+        }
+
+    @staticmethod
+    def _build_ability_payload(
+        prompt: str, ability_type: int,
+        ability_param_inner: Dict[str, Any], reply_format: str,
+        text_suffix: str = "",
+    ) -> Dict[str, Any]:
+        """构造新端点 payload（client_meta/messages/option/chat_ability）。
+
+        ability_param_inner 为 ability_param 的**内部结构**（json.dumps 后放入）：
+          - 图片（ability_type=3）用嵌套包装：
+            {"ability_param": {...}, "ability_type": 1}
+          - 视频（ability_type=17）用扁平结构：
+            {"ratio", "model", "duration", "input_box_content"}
+        （两者均为 2026-10-19 抓包自真实前端的地面真值。）
+        """
+        now_ms = int(time.time() * 1000)
+        return {
+            "client_meta": {
+                "local_conversation_id": f"local_{now_ms}",
+                "conversation_id": "",
+                "bot_id": "7338286299411103781",
+                "last_section_id": "",
+                "last_message_index": None,
+                "local_permissions": [
+                    {"permission_name": "ACCESS_COARSE_LOCATION", "status": 3},
+                    {"permission_name": "ACCESS_FINE_LOCATION", "status": 3},
+                    {"permission_name": "ACCESS_BACKGROUND_LOCATION", "status": 3},
+                ],
+            },
+            "messages": [{
+                "local_message_id": str(uuid.uuid4()),
+                "content_block": [{
+                    "block_type": 10000,
+                    "content": {
+                        "text_block": {
+                            "text": f"{reply_format % prompt}{text_suffix}",
+                            "icon_url": "", "icon_url_dark": "", "summary": "",
+                        },
+                        "pc_event_block": "",
+                    },
+                    "block_id": str(uuid.uuid4()),
+                    "parent_id": "",
+                    "meta_info": [],
+                    "extra_info": {},
+                    "append_fields": [],
+                }],
+                "message_status": 0,
+            }],
+            "option": {
+                "send_message_scene": "",
+                "create_time_ms": now_ms,
+                "collect_id": "",
+                "is_audio": False,
+                "answer_with_suggest": False,
+                "tts_switch": False,
+                "need_deep_think": 0,
+                "click_clear_context": False,
+                "from_suggest": False,
+                "is_regen": False,
+                "is_replace": False,
+                "is_from_click_option": False,
+                "is_from_click_softlink": False,
+                "disable_sse_cache": False,
+                "select_text_action": "",
+                "is_select_text": False,
+                "resend_for_regen": False,
+                "scene_type": 0,
+                "unique_key": str(uuid.uuid4()),
+                "start_seq": 0,
+                "need_create_conversation": True,
+                "conversation_init_option": {"need_ack_conversation": True},
+                "regen_query_id": [],
+                "edit_query_id": [],
+                "regen_instruction": "",
+                "no_replace_for_regen": False,
+                "message_from": 0,
+                "shared_app_name": "",
+                "shared_app_id": "",
+                "sse_recv_event_options": {"support_chunk_delta": True},
+                "support_lazy_fetch_stream": True,
+                "is_ai_playground": False,
+                "is_old_user": True,
+                "general_task_param": {"server_do_compare": True},
+                "recovery_option": {"is_recovery": False,
+                                    "req_create_time_sec": int(time.time()),
+                                    "append_sse_event_scene": 0},
+                "message_storage_type": 0,
+                "related_deleted_message_ids": {},
+                "connector_info_list": [],
+                "model_config": {"model_item_key": "", "model_extra_params": {}},
+                "aggregate_params": {
+                    "mention_skill_list": "[]",
+                    "mention_plugin_list": "[]",
+                    "mention_ext": "[{}]",
+                    "conversation_mode": "1",
+                    "mode_id": "",
+                    "model_item_key": "",
+                    "agent_mode": "",
+                    "reasoning_effort": "",
+                    "provider_id": "",
+                },
+                "conversation_mode": 1,
+            },
+            "chat_ability": {
+                "ability_type": ability_type,
+                "ability_param": json.dumps(ability_param_inner, ensure_ascii=False),
+            },
+            "user_context": [],
+            "ext": {
+                "answer_with_suggest": "0",
+                "sub_conv_firstmet_type": "1",
+                "general_task_param": "{\"server_do_compare\":true}",
+                "collection_id": "",
+                "is_finish": "1",
+                "conversation_init_option": "{\"need_ack_conversation\":true}",
+                "commerce_credit_config_enable": "0",
+            },
+        }
+
+    async def _post_ability(
+        self, payload: Dict[str, Any], timeout: float
+    ) -> str:
+        """POST 新端点 /chat/completion（免签名），返回 SSE 原文。"""
+        params = self._new_endpoint_params()
+        url = (
+            f"{self.BASE_URL}/chat/completion?"
+            f"{urlencode(dict(sorted(params.items())))}"
+        )
+        headers = {
+            "Accept": "text/event-stream",
+            "Content-Type": "application/json",
+            "Agw-Js-Conv": "str",
+            "Referer": "https://www.doubao.com/chat/",
+        }
+        async with self.session.post(
+            url,
+            data=json.dumps(payload, ensure_ascii=False),
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=timeout),
+        ) as resp:
+            if resp.status != 200:
+                error_text = await resp.text()
+                raise DoubaoChatError(
+                    f"ability request failed ({resp.status}): {error_text[:500]}"
+                )
+            return (await resp.read()).decode("utf-8", errors="replace")
+
+    def _parse_image_ability_sse(
+        self, raw: str, prompt: str, requested_model: str
+    ) -> "ImageGenerationResult":
+        """解析新端点的生图 SSE（命名事件 + patch_op 增量结构）。
+
+        成品在 STREAM_CHUNK 的 patch_op → content_block → block_type=2074
+        → creation_block.creations[].image；URL 优先级
+        image_ori_raw（image_raw 无水印）> image_ori > image_thumb。
+        """
+        result = ImageGenerationResult(prompt=prompt, model=requested_model)
+        notice_parts: List[str] = []
+
+        def _collect_image(img: Dict[str, Any]) -> None:
+            if not isinstance(img, dict):
+                return
+            ori = img.get("image_ori", {}) or {}
+            raw_img = img.get("image_ori_raw", {}) or {}
+            thumb = img.get("image_thumb", {}) or {}
+            result.images.append(GeneratedImage(
+                key=img.get("key", ""),
+                thumb_url=thumb.get("url", ""),
+                ori_url=ori.get("url", ""),
+                raw_url=raw_img.get("url", ""),
+                ori_raw_url=raw_img.get("url", ""),
+                width=ori.get("width", 0) or thumb.get("width", 0),
+                height=ori.get("height", 0) or thumb.get("height", 0),
+                format=ori.get("format", "") or thumb.get("format", ""),
+            ))
+
+        for block in raw.split("\n\n"):
+            if not block.strip():
+                continue
+            event_name = ""
+            data_str = ""
+            for line in block.strip().split("\n"):
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_str += line[5:].strip()
+            if not data_str:
+                continue
+            if event_name == "STREAM_ERROR":
+                try:
+                    err = json.loads(data_str)
+                    code = err.get("error_code", "")
+                    if code in RISK_ERROR_CODES:
+                        raise DoubaoRateLimitError(
+                            f"ability rate limited: {code}")
+                    raise DoubaoChatError(
+                        f"ability stream error: {str(err)[:300]}")
+                except json.JSONDecodeError:
+                    pass
+            if event_name not in ("STREAM_CHUNK", "FULL_MSG_NOTIFY",
+                                  "STREAM_MSG_NOTIFY"):
+                continue
+            try:
+                d = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            # 增量 patch
+            for patch in d.get("patch_op", []) or []:
+                pv = patch.get("patch_value", {})
+                if not isinstance(pv, dict):
+                    continue
+                for cb in pv.get("content_block", []) or []:
+                    if not isinstance(cb, dict) or cb.get("block_type") != 2074:
+                        continue
+                    creation = (cb.get("content", {}) or {}).get(
+                        "creation_block", {}) or {}
+                    for cr in creation.get("creations", []) or []:
+                        if isinstance(cr, dict) and cr.get("image"):
+                            _collect_image(cr["image"])
+            # 完整消息（FULL_MSG_NOTIFY）
+            msg = d.get("message", {})
+            if isinstance(msg, dict):
+                for cb in msg.get("content_block", []) or []:
+                    if not isinstance(cb, dict) or cb.get("block_type") != 2074:
+                        continue
+                    creation = (cb.get("content", {}) or {}).get(
+                        "creation_block", {}) or {}
+                    for cr in creation.get("creations", []) or []:
+                        if isinstance(cr, dict) and cr.get("image"):
+                            _collect_image(cr["image"])
+            # 服务端提示文本（付费墙等）
+            text_blob = data_str
+            for kw in ("订阅标准套餐专属能力", "不可用于创作", "升级正式订阅",
+                       "免费体验套餐"):
+                if kw in text_blob:
+                    notice_parts.append(kw)
+
+        if notice_parts and not result.images:
+            result.notice = (
+                "当前账号无该模型的创作额度（服务端返回订阅提示），"
+                "未出图。可切换到免费档模型，或升级订阅。"
+            )
+        # 去重（同一张图可能同时出现在 patch 与 full notify 里）
+        seen = set()
+        uniq = []
+        for img in result.images:
+            k = img.ori_raw_url or img.ori_url or img.thumb_url or img.key
+            if k and k not in seen:
+                seen.add(k)
+                uniq.append(img)
+        result.images = uniq
+        return result
+
+    async def _generate_image_ability(
+        self,
+        prompt: str,
+        ratio: Optional[str],
+        image_model: str,
+        style: str,
+        timeout: float,
+    ) -> "ImageGenerationResult":
+        """新协议文生图：模型/比例/风格精确选择（chat_ability 通道）。"""
+        model = image_model or "Seedream 4.0"
+        text = prompt
+        if style:
+            text = f"{prompt}。图片风格为{IMAGE_STYLE_LABELS.get(style, style)}"
+        # 图片的 ability_param 是嵌套包装（抓包真值）
+        inner = {
+            "ability_param": {
+                "model": model,
+                "ratio": ratio or "auto",
+                "input_box_content": {
+                    "user_input_content": text,
+                    "reply_message_format": "生成图片：%s",
+                },
+            },
+            "ability_type": 1,
+        }
+        payload = self._build_ability_payload(
+            prompt, 3, inner, "生成图片：%s",
+        )
+        raw = await self._post_ability(payload, timeout)
+        return self._parse_image_ability_sse(raw, prompt, model)
+
+    @staticmethod
+    def _parse_ability_ack(raw: str) -> Tuple[str, str]:
+        """从新端点 SSE 提取 (conversation_id, agent 文本)。
+
+        SSE_ACK 的 ack_client_meta 里有真实 conversation_id；
+        STREAM_CHUNK 的文本块里是 agent 回复（付费墙提示等）。
+        """
+        conv_id, _local, text = DoubaoChatClient._parse_ability_ack_full(raw)
+        return conv_id, text
+
+    @staticmethod
+    def _parse_ability_ack_full(raw: str) -> Tuple[str, str, str]:
+        """从新端点 SSE 提取 (conversation_id, local_conversation_id, agent 文本)。
+
+        local_conversation_id 用于第二步「确认」追问时续接会话上下文。
+        """
+        conv_id = ""
+        local_id = ""
+        texts: List[str] = []
+        for block in raw.split("\n\n"):
+            if not block.strip():
+                continue
+            event_name = ""
+            data_str = ""
+            for line in block.strip().split("\n"):
+                if line.startswith("event:"):
+                    event_name = line[6:].strip()
+                elif line.startswith("data:"):
+                    data_str += line[5:].strip()
+            if not data_str:
+                continue
+            try:
+                d = json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+            if event_name == "SSE_ACK":
+                meta = d.get("ack_client_meta", {}) or {}
+                cid = meta.get("conversation_id", "")
+                if cid and str(cid).isdigit() and len(str(cid)) >= 15:
+                    conv_id = str(cid)
+                lid = meta.get("local_conversation_id", "")
+                if lid:
+                    local_id = str(lid)
+            # 文本块（含付费墙提示）
+            for patch in d.get("patch_op", []) or []:
+                pv = patch.get("patch_value", {})
+                if not isinstance(pv, dict):
+                    continue
+                for cb in pv.get("content_block", []) or []:
+                    if not isinstance(cb, dict) or cb.get("block_type") != 10000:
+                        continue
+                    tb = (cb.get("content", {}) or {}).get("text_block", {}) or {}
+                    t = tb.get("text", "")
+                    if t:
+                        texts.append(t)
+        return conv_id, local_id, "".join(texts).strip()
+
+    @staticmethod
+    def _is_video_confirm_card(agent_text: str) -> bool:
+        """判断 agent 回复是否是「视频生成参数确认」卡（需二次确认）。
+
+        确认卡特征文本（2026-10-19 抓包真值）：
+          - 「请先确认以下参数」+「视频生成参数确认」+「确认后我再开始生成视频」
+        真实前端此处也没有按钮，用户靠文字回复「确认」推进。
+        """
+        if not agent_text:
+            return False
+        return ("确认" in agent_text
+                and ("参数" in agent_text or "确认后" in agent_text))
+
+    async def _send_ability_followup(
+        self,
+        conversation_id: str,
+        local_conversation_id: str,
+        text: str,
+        ability_inner: Optional[Dict[str, Any]] = None,
+        timeout: float = 180,
+    ) -> str:
+        """在已有会话里发一条文本追问（如「确认」），返回 SSE 原文。
+
+        用于视频生成两步流程的第二步：确认卡回复。
+        ability_inner 非空时附带 chat_ability（与首条一致，服务端据此
+        延续视频任务上下文）。
+        """
+        now_ms = int(time.time() * 1000)
+        payload = self._build_ability_payload(
+            text, 17, ability_inner or {}, "生成视频：%s",
+        )
+        # 覆盖 client_meta：续接会话而非新建
+        payload["client_meta"]["local_conversation_id"] = (
+            local_conversation_id or f"local_{now_ms}")
+        payload["client_meta"]["conversation_id"] = str(conversation_id)
+        # 追问消息的文本就是「确认」本身
+        payload["messages"][0]["content_block"][0]["content"]["text_block"]["text"] = text
+        payload["option"]["need_create_conversation"] = False
+        return await self._post_ability(payload, timeout)
+
+    async def _generate_video_ability(
+        self,
+        prompt: str,
+        ratio: Optional[str],
+        video_model: str,
+        video_duration: int,
+        timeout: float,
+        poll_timeout: float,
+    ) -> "VideoGenerationResult":
+        """新协议文生视频：模型/时长/比例精确选择（chat_ability ability_type=17）。
+
+        提交响应是短 ACK（异步渲染），成品随后推送进会话，
+        走与 samantha 链路相同的 latest_messagelist 轮询取回。
+        """
+        # 视频的 ability_param 是扁平结构（抓包真值）
+        inner = {
+            "ratio": ratio or "auto",
+            "model": video_model,
+            "duration": video_duration,
+            "input_box_content": {
+                "user_input_content": prompt,
+                "reply_message_format": "生成视频：%s",
+            },
+        }
+        payload = self._build_ability_payload(
+            prompt, 17, inner, "生成视频：%s",
+            text_suffix=f"，{video_duration}s",
+        )
+        raw = await self._post_ability(payload, timeout)
+
+        result = VideoGenerationResult(prompt=prompt, model=video_model)
+        conv_id, local_id, agent_text = self._parse_ability_ack_full(raw)
+        result.conversation_id = conv_id
+        result.agent_reply = agent_text
+
+        # 风控
+        if "710022004" in raw or "710022002" in raw:
+            result.agent_reply = (
+                f"{agent_text}\n[风控] 请求被豆包网关拦截（710022004），"
+                "请稍后重试或更换网络环境。"
+            ).strip()
+            return result
+        # 付费墙
+        if any(k in agent_text for k in ("不可用于创作", "升级正式订阅",
+                                         "免费体验套餐", "订阅标准套餐专属能力")):
+            result.agent_reply += (
+                "（当前账号无该视频模型的创作额度，需更换账号或升级订阅）")
+            return result
+
+        # 第二步：确认卡 → 回复「确认」→ 服务端才真正提交渲染任务
+        # （2026-10-19 抓包真值：真实前端也无按钮，靠文字回复推进；
+        #  确认后响应出现 block_type=10040 thinking_block
+        #  「视频生成已提交 / 视频生成中」）
+        if conv_id and self._is_video_confirm_card(agent_text):
+            try:
+                raw2 = await self._send_ability_followup(
+                    conv_id, local_id, "确认", ability_inner=inner,
+                    timeout=timeout,
+                )
+                if "710022004" in raw2 or "710022002" in raw2:
+                    result.agent_reply += (
+                        "\n[风控] 确认请求被豆包网关拦截（710022004），"
+                        "请稍后重试。")
+                    return result
+                _, _, agent_text2 = self._parse_ability_ack_full(raw2)
+                if agent_text2:
+                    result.agent_reply = agent_text2
+                if any(k in agent_text2 for k in (
+                        "不可用于创作", "升级正式订阅", "免费体验套餐",
+                        "订阅标准套餐专属能力")):
+                    result.agent_reply += (
+                        "（当前账号无该视频模型的创作额度，"
+                        "需更换账号或升级订阅）")
+                    return result
+            except Exception as e:  # noqa: BLE001
+                result.agent_reply += f"\n[确认步骤失败] {e}"
+                return result
+
+        if conv_id:
+            await self._poll_conversation_video(result, set(), poll_timeout)
+        return result
+
     async def generate_image(
         self,
         prompt: str,
@@ -1617,11 +2173,17 @@ class DoubaoChatClient:
         memory_type: Optional[int] = None,
         save_history: Optional[bool] = None,
         no_watermark: bool = True,
+        image_model: str = "",
+        style: str = "",
+        new_protocol: bool = True,
     ) -> "ImageGenerationResult":
         """Generate images using Doubao's AI image generation.
 
-        Uses /samantha/chat/completion with content_type=2009 (SamanthaImageInput)
-        and skill_type=3 (SkillImageGen).
+        双协议（2026-10-19 起）：
+          - **文生图**默认走新统一端点 ``/chat/completion`` + ``chat_ability``
+            （真实前端同款）：模型/比例/风格精确选择，响应回显生效模型。
+          - **图生图**（带 ref key）走旧 ``/samantha/chat/completion``
+            agent 通道（content_type=2009 + skill_type=3），无模型选择。
 
         Args:
             prompt: Text description of the image to generate.
@@ -1632,12 +2194,58 @@ class DoubaoChatClient:
             timeout: Max seconds to wait for generation.
             memory_type: Optional 0 (save to web history) or 2 (ephemeral).
             save_history: If True, sets memory_type=0.
+            no_watermark: If True (default), forces memory_type=0 so the server
+                sends watermark-free templates (dwm3 / image_raw).
+            image_model: 官方 model key（图片项 item_id=45033999706177282 的
+                「模型」选择器 selector id=30，option_key 即显示文本，仅新协议生效）：
+                - ``Seedream 5.0 Flash``（专业快速，默认推荐）
+                - ``Seedream 5.0 Pro``（专业出图・4 倍消耗，需订阅，免费账号不出图）
+                - ``Seedream 4.5``（日常生成）
+                - ``Seedream 4.0``（基础生图）
+                留空 = Seedream 4.0。
+            style: 官方风格 key（「风格」选择器 selector id=4 的 option_key），
+                如 ``skill_image_styles_film``（电影写真）。按官方 message_text
+                规则注入自然语言（「图片风格为电影写真」）。共 32 种，
+                完整列表见 ``IMAGE_STYLES`` / ``doubao_models`` 工具。
+            new_protocol: 文生图是否走新端点（默认 True；False 走旧 agent 通道）。
 
         Returns:
             ImageGenerationResult with list of generated images.
         """
+        # 收集参考图 key
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
+
+        # 文生图 + 新协议：模型/比例/风格精确选择
+        if new_protocol and not keys:
+            try:
+                return await self._generate_image_ability(
+                    prompt, ratio, image_model, style, timeout
+                )
+            except DoubaoRateLimitError:
+                raise  # 风控不重试，交给上层提示
+            except DoubaoChatError:
+                # 新端点失败时退回旧 agent 通道（不传模型，旧协议不支持）
+                log.warning("new endpoint failed, fallback to samantha agent channel")
+
+        text = prompt
+        if style:
+            text = f"{prompt}。图片风格为{IMAGE_STYLE_LABELS.get(style, style)}"
+        content_dict: Dict[str, Any] = {"text": text}
+        if ratio:
+            content_dict["ratio"] = ratio
+        if image_model:
+            # 与视频链路的 video-model 同构：结构化字段 + option_key 原样传递
+            content_dict["image-model"] = image_model
+
         message: Dict[str, Any] = {
-            "content": json.dumps({"text": prompt}, ensure_ascii=False),
+            "content": json.dumps(content_dict, ensure_ascii=False),
             "content_type": 2009,  # SamanthaImageInput
             "attachments": [],
             "references": [],
@@ -1648,16 +2256,6 @@ class DoubaoChatClient:
                 "skill_id_no_default": "3",
             },
         }
-
-        keys = []
-        if ref_image_keys:
-            if isinstance(ref_image_keys, str):
-                keys.append(ref_image_keys)
-            elif isinstance(ref_image_keys, (list, tuple)):
-                keys.extend([k for k in ref_image_keys if k])
-        if ref_image_key and ref_image_key not in keys:
-            keys.insert(0, ref_image_key)
-
         if keys:
             message["attachments"] = [
                 {"type": "image", "key": k, "extra": {"refer_types": "overall"}}
@@ -1666,7 +2264,7 @@ class DoubaoChatClient:
 
         if ratio:
             message["content"] = json.dumps(
-                {"text": prompt, "ratio": ratio}, ensure_ascii=False
+                {"text": text, "ratio": ratio}, ensure_ascii=False
             )
 
         eff_mem_type = resolve_memory_type(memory_type, save_history)
@@ -1809,14 +2407,20 @@ class DoubaoChatClient:
         video_duration: int = 10,
         launch_stage: int = 2,
         poll_timeout: float = 900,
+        new_protocol: bool = True,
     ) -> "VideoGenerationResult":
         """Generate video using Doubao's AI video generation.
 
-        Uses /samantha/chat/completion with content_type=2020
-        (SamanthaVideoGenerationInput) and skill_type=17 (SkillVideoGeneration).
-
-        Video generation is ASYNC: the initial request returns a task_id,
-        then the client polls /samantha/chat/async/stream for the result.
+        双协议（2026-10-19 起）：
+          - **新统一端点** ``/chat/completion`` + ``chat_ability``
+            （ability_type=17，真实前端同款）：模型/时长/比例精确选择，
+            服务端按模型额度门控（免费账号请求需订阅档会明确返回不出图）。
+            提交后服务端先回「参数确认卡」，自动二次回复「确认」，
+            任务才真正进入渲染（响应出现 block_type=10040
+            thinking_block「视频生成已提交」）。
+          - **旧 agent 通道** ``/samantha/chat/completion``
+            （content_type=2020 + skill_type=17）：作为兜底，
+            模型选择可能被 agent 忽略（实测会自定档位）。
 
         Args:
             prompt: Text description of the video to generate.
@@ -1827,23 +2431,48 @@ class DoubaoChatClient:
             timeout: Max seconds to wait for video generation (default 300).
             memory_type: Optional 0 (save to web history) or 2 (ephemeral).
             save_history: If True, sets memory_type=0.
-            video_model: 官方 model key，三档（来自 /alice/slot/action_bar_v3/get_item_conf）：
-                - ``seedance_v2.0_mini``（默认，日常生成，1x 消耗）
-                - ``seedance_v2.0``（2.0 Fast，快速出片）
-                - ``seedance_v2.0_std``（2.0，进阶画面表现，2x 消耗）
+            video_model: 官方 model key，四档（来自 /alice/slot/action_bar_v3/get_item_conf
+                视频项 item_id=45337547893174274 的「模型」选择器 selector id=6）：
+                - ``seedance_v2.0_mini``（默认，日常生成，免费额度可跑）
+                - ``seedance_v2.0``（2.0 Fast，快速出片，免费额度可跑）
+                - ``seedance_v2.0_std``（2.0，进阶画面表现，2x 消耗，🔒需订阅）
+                - ``seedance_v2.5``（旗舰 30 秒，5x 消耗，🔒需订阅）
             video_duration: 官方时长档，只支持 5 / 10（默认 10）。
-            launch_stage: ``2``= 直接进入生成（实测唯一能真正触发 Seedance 的档）；
-                ``1``/``0`` 会降级为 agent 反复追问参数、任务不落地。
-            poll_timeout: agent 通道取回成品的最长等待秒数（默认 900=15 分钟，
-                与 agent 口头预计的等待时间匹配）。
+            launch_stage: 旧 agent 通道参数；``2``= 直接进入生成。
+            poll_timeout: 取回成品的最长等待秒数（默认 900=15 分钟）。
+            new_protocol: 是否走新端点（默认 True；失败自动回退旧通道）。
 
         Returns:
             VideoGenerationResult with list of generated videos.
         """
+        # 新协议：模型/时长/比例精确选择（文生视频；图生视频仍走旧通道）
+        keys = []
+        if ref_image_keys:
+            if isinstance(ref_image_keys, str):
+                keys.append(ref_image_keys)
+            elif isinstance(ref_image_keys, (list, tuple)):
+                keys.extend([k for k in ref_image_keys if k])
+        if ref_image_key and ref_image_key not in keys:
+            keys.insert(0, ref_image_key)
+
+        if new_protocol and not keys:
+            try:
+                return await self._generate_video_ability(
+                    prompt, ratio, video_model, video_duration,
+                    timeout, poll_timeout,
+                )
+            except (DoubaoRateLimitError, DoubaoChatError) as exc:
+                # 新端点传输层失败（风控/网络）→ 回退旧 agent 通道
+                log.warning(
+                    "video new endpoint failed (%s), fallback to samantha",
+                    str(exc)[:120],
+                )
+
         model_label = {
             "seedance_v2.0_mini": "Seedance 2.0 Mini",
             "seedance_v2.0": "Seedance 2.0 Fast",
             "seedance_v2.0_std": "Seedance 2.0",
+            "seedance_v2.5": "Seedance 2.5",
         }.get(video_model, video_model)
         ratio_text = f"、比例 {ratio}" if ratio else ""
 
@@ -1881,15 +2510,6 @@ class DoubaoChatClient:
                 "skill_id_no_default": "17",
             },
         }
-
-        keys = []
-        if ref_image_keys:
-            if isinstance(ref_image_keys, str):
-                keys.append(ref_image_keys)
-            elif isinstance(ref_image_keys, (list, tuple)):
-                keys.extend([k for k in ref_image_keys if k])
-        if ref_image_key and ref_image_key not in keys:
-            keys.insert(0, ref_image_key)
 
         for k in keys:
             message["attachments"].append({"type": "image", "key": k})
@@ -2174,8 +2794,10 @@ class DoubaoChatClient:
                                     url = base64.b64decode(main_b64).decode(
                                         "utf-8", errors="replace"
                                     )
-                                    width = int(vi.get("width") or width)
-                                    height = int(vi.get("height") or height)
+                                    # 真实尺寸在 vwidth/vheight（top-level 的
+                                    # width/height 是封面缩略图尺寸 384x216）
+                                    width = int(vi.get("vwidth") or width)
+                                    height = int(vi.get("vheight") or height)
                                     break
                         except Exception:  # noqa: BLE001
                             url = ""
