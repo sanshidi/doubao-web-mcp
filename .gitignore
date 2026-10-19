@@ -1,0 +1,19 @@
+# 依赖与环境
+.venv/
+venv/
+__pycache__/
+*.pyc
+
+# 本地账号凭证（绝不入库）
+*.doubao_session.json
+.doubao_browser/
+accounts.json
+.env
+
+# 生成物
+*.log
+豆包输出/
+Downloads/
+
+# 系统
+.DS_Store
