@@ -89,7 +89,6 @@ Cookie 获取：浏览器登录 doubao.com → F12 → Application → Cookies �
   签名必须走浏览器页面 evaluate（已验证 `X-Bogus` 参数名 + 16 位短签名）。
 
 ## 📄 协议要点（逆向笔记）
-
 - 对话：`POST /chat/completion`（新版端点，免签名），payload 为 `client_meta/messages[].content_block[{block_type:10000,text_block}]/option/ext` 结构，**必须带 `Agw-Js-Conv: str` 头**。
 - 上传图片：`POST /samantha/pages/upload_image` → 拿 uri → `POST /alice/message/get_file_url` 换 CDN 链接。
 - 文生图：`/samantha/chat/completion` + `content_type:2009` + `skill_type:3`（免签名）。
@@ -97,6 +96,17 @@ Cookie 获取：浏览器登录 doubao.com → F12 → Application → Cookies �
   响应 SSE 提取 `fin_reason.async_task.id` → 轮询 `/samantha/chat/async/stream`。
 - 凭证：`sessionid` Cookie（登录态）；`msToken` 假值会触发 710022002，留空最安全。
 - 响应头 `x-ms-token` 可用于 msToken 轮换（当前未启用）。
+
+## 📜 开源许可与致谢
+
+本项目以 **Apache License 2.0** 发布（见 `LICENSE`）。
+
+`doubao_client.py` 是从 **[doubao2api](https://github.com/SeiShonagon520/doubao2api)**
+（Apache 2.0）的 `client.py` vendored 并改造而来 —— 修复了 `upload_image` 的 `NameError`、
+内联了相对导入、新增 X-Bogus 签名器。逐条改动见 `NOTICE`。
+
+思路参考 [web-ai-mcp](https://github.com/983033995/web-ai-mcp)（DeepSeek 网页版接入 MCP）。
+豆包网页版协议为逆向所得，仅供个人学习研究。
 
 ## 免责声明
 

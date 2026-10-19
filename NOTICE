@@ -1,0 +1,25 @@
+# NOTICE
+
+doubao-web-mcp
+Copyright 2026 sanshidi
+
+本项目包含来自 doubao2api 项目的衍生代码，特此声明：
+
+  doubao2api
+  https://github.com/SeiShonagon520/doubao2api
+  Copyright the doubao2api contributors
+  Licensed under the Apache License, Version 2.0 (见本仓库 LICENSE 文件)
+
+## 衍生文件：doubao_client.py
+
+该文件是 doubao2api 中 `doubao2api/client.py` 的 vendored 副本，并经过以下修改：
+
+1. **修复** `upload_image` 中 `file_info` 未定义导致的 `NameError`（改为 `file_info = file_urls[0]`）。
+2. **内联相对导入**：`CHROMIUM_BUILD`、`iter_sse_events`、`resolve_memory_type` 三个依赖改为文件内直接定义，使 `doubao_client.py` 可作为独立模块运行，无需 doubao2api 包结构。
+3. **新增签名器能力**：新增 `_signed_url()` 方法与 `_XSigner` 类。`_XSigner` 常驻一个 headless Chromium 页面，通过 `evaluate()` 调用豆包页面内的 `window.bdms.frontierSign(query_string)` 生成 `X-Bogus` 签名。图生视频端点（`content_type=2020` / `skill_type=17`）需要该签名，`generate_video()` 已改用签名 URL 提交任务。
+4. **降级** `captcha_handler` 为 no-op（原实现依赖 doubao2api 的浏览器上下文）。
+5. 移除对 doubao2api 会话文件格式的依赖，改为直读账号池提供的 sessionid。
+
+## 独立文件
+
+`direct_server.py`、`server.py`、`README.md` 为本项目原创。
