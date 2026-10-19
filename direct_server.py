@@ -295,10 +295,24 @@ async def doubao_image(prompt: str, image_path: str = "", ratio: str = "1:1") ->
 
 
 @mcp.tool()
-async def doubao_video(prompt: str, image_path: str = "", ratio: str = "9:16") -> str:
-    """文生视频或图生视频（核心能力，通常 1-3 分钟）。传 image_path 即为图生视频。
-    ratio: 9:16（竖屏）/ 16:9 / 1:1。首次视频调用会自动启动签名器浏览器（约5秒）。
-    返回本地 mp4 路径。"""
+async def doubao_video(
+    prompt: str,
+    image_path: str = "",
+    ratio: str = "9:16",
+    video_model: str = "seedance_v2.0_mini",
+    duration: int = 10,
+) -> str:
+    """文生视频 / 图生视频（Seedance）。传 image_path 即为图生视频。
+
+    ratio: 9:16（竖屏）/ 16:9 / 1:1 / 21:9
+    video_model: seedance_v2.0_mini（默认，1x）/ seedance_v2.0（Fast）/ seedance_v2.0_std（2x）
+    duration: 5 或 10秒
+
+    🔒 已知限制（2026-10-19 实测）：豆包视频生成需要**正式订阅**，
+    免费体验套餐会在最后的额度扣减环节被拦（agent 回复
+    「当前免费体验套餐不可用于创作使用」）。协议链路本身已打通，
+    开通后即可直接返回 mp4 路径。开通入口见返回文案。
+    """
     accounts, acc = _pick_account()
     if not acc:
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
@@ -311,15 +325,62 @@ async def doubao_video(prompt: str, image_path: str = "", ratio: str = "9:16") -
                     return f"❌ 图片不存在：{p}"
                 up = await c.upload_image(p.read_bytes(), p.name)
                 ref_key = up.get("uri", "")
-            result = await c.generate_video(prompt, ratio=ratio, ref_image_key=ref_key)
-            if not result.videos:
-                return "⚠️ 未拿到视频（可能被风控，先用 doubao_ping 探测）"
-            v = result.videos[0]
-            url = getattr(v, "video_url", "") or getattr(v, "url", "")
-            if not url:
-                return f"⚠️ 视频结果无 URL：{vars(v) if hasattr(v, '__dict__') else v}"
-        path = _save(url, ".mp4")
-        return f"✅ 视频已保存：{path}"
+            result = await c.generate_video(
+                prompt,
+                ratio=ratio,
+                ref_image_key=ref_key,
+                video_model=video_model,
+                video_duration=duration,
+            )
+
+            # 直返 mp4（服务端偶发同步返回时）
+            if result.videos:
+                v = result.videos[0]
+                url = getattr(v, "video_url", "") or getattr(v, "url", "")
+                if url:
+                    path = _save(url, ".mp4")
+                    return f"✅ 视频已保存：{path}"
+
+            reply = getattr(result, "agent_reply", "") or ""
+
+            # 🔴 付费墙判定（2026-10-19 实测四种模型/时长组合均命中）
+            # 参数齐全后 agent 才会走到扣费环节，此时返回订阅提示。
+            # 这不是协议/风控问题，纯账号套餐限制。
+            if "免费体验套餐" in reply or "升级正式订阅" in reply:
+                return (
+                    "🔒 豆包视频生成需要正式订阅（当前账号是免费体验套餐）。\n"
+                    "   已确认这不是协议或风控问题：链路完全打通，模型/时长/比例参数\n"
+                    "   均被服务端正确接收，卡在最后的额度扣减环节。\n"
+                    f"   豆包提示：{reply[:120]}\n"
+                    "   开通入口：https://www.doubao.com/member/subscription"
+                    "?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting\n"
+                    "   开通后本工具即可直接返回 mp4 路径。"
+                )
+
+            # 参数没被识别 —— agent 在追问，需要把参数写进自然语言
+            if "确认" in reply or "建议" in reply:
+                return (
+                    "⚠️ 豆包未接受参数，正在追问确认，任务未生成。\n"
+                    f"   豆包回复：{reply[:180]}\n"
+                    "   建议：把比例/时长/模型直接写进 prompt 描述里，例如\n"
+                    '   「生成一个 16:9、10 秒、Seedance 2.0 Mini 的视频：……」。'
+                )
+
+            # 异步：回传会话链接，让用户去网页端取成品
+            conv = getattr(result, "conversation_id", "") or ""
+            link = (
+                f"https://www.doubao.com/chat/{conv}" if conv else "https://www.doubao.com/chat/"
+            )
+            lines = [
+                "⏳ 视频任务已提交（异步渲染，官方口径约 10 分钟）",
+                f"   模型：{video_model} · 时长 {duration}s · 比例 {ratio}",
+            ]
+            if reply:
+                lines.append(f"   豆包回复：{reply[:150]}")
+            if conv:
+                lines.append(f"   会话链接：{link}")
+            lines.append("   完成后豆包会在该会话推送成品，打开链接即可预览下载。")
+            return "\n".join(lines)
     except Exception as e:
         return _fail(e)
 
