@@ -1999,6 +1999,13 @@ class DoubaoChatClient:
         """从新端点 SSE 提取 (conversation_id, local_conversation_id, agent 文本)。
 
         local_conversation_id 用于第二步「确认」追问时续接会话上下文。
+
+        文本提取规则（2026-10-19 抓包真值）：agent 回复的完整文本分散在
+        **两类事件**里，必须都收集并按流顺序拼接——
+          - ``STREAM_CHUNK`` 的 patch_op 只带**首字符**（建块时的初始 patch）；
+          - 其余全文在后续的 ``CHUNK_DELTA`` 增量里（``{"text": "..."}``）。
+        只解析 patch_op 会只拿到一个字（曾导致确认卡识别失败、视频任务
+        永远停在确认步）。
         """
         conv_id = ""
         local_id = ""
@@ -2027,7 +2034,7 @@ class DoubaoChatClient:
                 lid = meta.get("local_conversation_id", "")
                 if lid:
                     local_id = str(lid)
-            # 文本块（含付费墙提示）
+            # 文本来源 1：STREAM_CHUNK 的 patch_op（首字符）
             for patch in d.get("patch_op", []) or []:
                 pv = patch.get("patch_value", {})
                 if not isinstance(pv, dict):
@@ -2039,6 +2046,11 @@ class DoubaoChatClient:
                     t = tb.get("text", "")
                     if t:
                         texts.append(t)
+            # 文本来源 2：CHUNK_DELTA 增量（全文主体）
+            if event_name == "CHUNK_DELTA":
+                t = d.get("text", "") or d.get("delta", "") or ""
+                if t:
+                    texts.append(t)
         return conv_id, local_id, "".join(texts).strip()
 
     @staticmethod
