@@ -45,16 +45,19 @@ python3 -m venv .venv
 ### 步骤一：扫码登录拿凭证（本项目自带，不依赖任何外部服务）
 
 ```bash
-.venv/bin/python login.py            # 无 GUI 环境：截二维码到 /tmp，手机扫
-.venv/bin/python login.py --headed   # 在自己终端跑：可见浏览器窗口扫码
-.venv/bin/python login.py --name 主号
+.venv/bin/python login_qr.py                    # 无 GUI 环境：截二维码到 /tmp，手机扫
+.venv/bin/python login_qr.py --name 主号        # 指定账号名
+.venv/bin/python login_qr.py --qr-out /tmp/qr.png --timeout 420   # 自定义二维码路径 / 等待秒数
 ```
 
 登录成功后凭证写入 `~/.doubao-mcp/accounts.json`（权限 600）。
 多账号就多跑几次，`--name` 区分，凭证会累积进同一个账号池。
 
-`login.py` 会自动完成：点开登录弹窗 → 勾选用户协议 → 清掉「下载电脑版」推广弹窗
-→ 截取二维码（2 倍分辨率）→ 轮询 `sessionid` 落地。
+`login_qr.py` 会自动完成：点开登录弹窗 → 关掉「下载电脑版」推广窗（必要时重开登录）
+→ 勾选用户协议 → 切到「扫码登录」tab → 截取二维码（2 倍分辨率）→ 轮询 `sessionid` 落地。
+
+> ⚠️ `login.py` 是早期版本，**在豆包新版登录页上有已知失效点**（推广窗与协议勾选框都移进了
+> shadow DOM，旧脚本的定位方式点不到它们，扫码后登录态不会落地）。新增账号请一律用 `login_qr.py`。
 
 ### 步骤二：注册 MCP
 
@@ -96,7 +99,8 @@ python3 -m venv .venv
 |---|---|
 | `direct_server.py` | MCP 服务（6 个工具 + 账号池） |
 | `doubao_client.py` | 豆包网页版协议客户端（vendored 自 doubao2api，修复了 `upload_image` 的 `file_info` 未定义 bug，内联了全部相对导入依赖；双协议：新统一端点 chat_ability〔模型选择〕+ 旧 samantha agent 通道〔兜底/图生图〕，含会话轮询取回与卡片解析） |
-| `login.py` | 扫码登录 → 抓 `sessionid` 写账号池（本项目自有能力） |
+| `login_qr.py` | 扫码登录 → 抓 `sessionid` 写账号池（**当前推荐**，修了 shadow DOM 遮挡 / 协议勾选 / 扫码 tab） |
+| `login.py` | 早期版扫码登录（保留，新版登录页上有已知失效点，勿用于新增账号） |
 
 ## 🔓 独立性
 
