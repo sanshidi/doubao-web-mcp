@@ -20,6 +20,7 @@
 """
 import argparse
 import asyncio
+import os
 import sys
 import time
 from pathlib import Path
@@ -178,17 +179,36 @@ async def main():
     ap.add_argument("--name", default="", help="账号名，默认按时间戳命名")
     ap.add_argument("--timeout", type=int, default=300, help="等待扫码的超时秒数")
     ap.add_argument("--qr-out", default="/tmp/doubao_login_qr.png", help="二维码截图路径")
+    ap.add_argument("--headed", action="store_true",
+                    help="可见浏览器窗口：用户可自己点「抖音一键登录」等按钮，脚本只负责捕获登录态")
+    ap.add_argument("--profile-dir", default="",
+                    help="持久化 profile 目录（如 ~/.doubao-mcp/profiles/账号名）。指定后扫码登录的会话会"
+                         "落在该 user_data_dir，供 profile_cookies.get_fresh_cookies 复用，实现「登录一次管很久」")
     args = ap.parse_args()
 
     name = args.name or f"账号-{time.strftime('%m%d-%H%M')}"
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        ctx = await browser.new_context(
-            user_agent=UA, locale="zh-CN", timezone_id="Asia/Shanghai",
-            viewport={"width": 1280, "height": 900},
-            device_scale_factor=2,  # 2 倍图，手机更好扫
-        )
+        if args.profile_dir:
+            # 持久化 profile：用 launch_persistent_context（本机 Playwright 版本
+            # 的 launch() 不接受 user_data_dir 参数）
+            os.makedirs(os.path.expanduser(args.profile_dir), exist_ok=True)
+            ctx = await p.chromium.launch_persistent_context(
+                os.path.expanduser(args.profile_dir),
+                headless=not args.headed,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+                user_agent=UA, locale="zh-CN", timezone_id="Asia/Shanghai",
+                viewport={"width": 1280, "height": 900},
+                device_scale_factor=2,  # 2 倍图，手机更好扫
+            )
+            browser = ctx.browser
+        else:
+            browser = await p.chromium.launch(headless=not args.headed)
+            ctx = await browser.new_context(
+                user_agent=UA, locale="zh-CN", timezone_id="Asia/Shanghai",
+                viewport={"width": 1280, "height": 900},
+                device_scale_factor=2,  # 2 倍图，手机更好扫
+            )
         page = await ctx.new_page()
 
         print(f"→ 打开豆包登录页：{LOGIN_URL}")
@@ -216,16 +236,26 @@ async def main():
         if await close_promo(page):
             print("→ 推广窗已关闭（登录弹窗被连带关闭，重新打开）")
 
-        # 第二轮：重新点登录 → 勾协议 → 切扫码 tab（推广窗一般只弹一次）
-        ok = await open_login_and_scan_tab(page)
-        if not ok:
-            print("⚠️ 没切到扫码 tab（页面结构可能变了），尝试直接截图")
+        # 第二轮：重新点登录 → 勾协议 →（无窗口模式）切扫码 tab
+        if args.headed:
+            await page.evaluate(CLICK_LOGIN_JS)
+            await page.wait_for_timeout(2500)
+            agreed = await check_agreement(page)
+            await page.wait_for_timeout(800)
+            print(f"   协议勾选: {'✅' if agreed else '⚠️ 未确认已勾选'}")
+            await shoot_qr(page, args.qr_out)
+            print(f"🖥 浏览器窗口已弹出（状态截图：{args.qr_out}）")
+            print("   请在窗口里自己操作：可点「抖音一键登录」，或用豆包 / 飞书 App 扫码")
+            print("   登录成功后本脚本自动捕获凭证并关闭窗口，无需其他操作")
         else:
-            print("→ 已切到「扫码登录」tab")
-
-        if await shoot_qr(page, args.qr_out):
-            print(f"📱 二维码已截图：{args.qr_out}")
-        print("   用豆包 App 或飞书 App 扫这个图")
+            ok = await open_login_and_scan_tab(page)
+            if not ok:
+                print("⚠️ 没切到扫码 tab（页面结构可能变了），尝试直接截图")
+            else:
+                print("→ 已切到「扫码登录」tab")
+            if await shoot_qr(page, args.qr_out):
+                print(f"📱 二维码已截图：{args.qr_out}")
+            print("   用豆包 App 或飞书 App 扫这个图")
 
         deadline = time.time() + args.timeout
         tick = 0
@@ -250,15 +280,17 @@ async def main():
                     print(f"   → 已点「{c}」")
             except Exception:
                 pass
-            # 二维码有有效期，定时重截。
-            # 注意：不要在这里无条件 close_promo —— shadow 里的「关闭」按钮可能是登录弹窗自己的 X，
-            # 会把登录弹窗关掉。只在截不到登录弹窗（说明被推广窗盖住了）时才处理。
+            # headed 模式下用户正在窗口里操作，绝不能替他点任何按钮，
+            # 只截一张状态图备查；无窗口模式才需要处理推广窗 / 重截二维码
             if tick % 5 == 0:
-                if not await shoot_qr(page, args.qr_out):
-                    if await close_promo(page):
-                        await open_login_and_scan_tab(page)
-                        await shoot_qr(page, args.qr_out)
-                    print(f"   （二维码已刷新，最新截图：{args.qr_out}）")
+                if args.headed:
+                    await shoot_qr(page, args.qr_out)
+                else:
+                    if not await shoot_qr(page, args.qr_out):
+                        if await close_promo(page):
+                            await open_login_and_scan_tab(page)
+                            await shoot_qr(page, args.qr_out)
+                        print(f"   （二维码已刷新，最新截图：{args.qr_out}）")
 
         print(f"\n⏱ 超时（{args.timeout}s）未检测到登录。二维码截图：{args.qr_out}")
         await browser.close()

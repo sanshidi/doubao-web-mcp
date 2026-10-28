@@ -39,6 +39,24 @@ from doubao_client import (
     VIDEO_MODELS,
 )
 
+# 无水印视频下载：优先纯 API（快），失败回退无头浏览器点面板（稳），最后带印原链接兜底。
+try:
+    from doubao_video_clean_dl import download_clean_video
+except Exception:  # 模块缺失/依赖不全时不拖垮整个 MCP
+    download_clean_video = None
+try:
+    from doubao_video_headless_dl import download_video_panel
+except Exception:
+    download_video_panel = None
+
+# C 方案（治本）：优先用持久化浏览器 profile 提取的「浏览器维护会话」cookie，
+# 没有 profile 的账号自动回退到 accounts.json 的静态 cookie（见 profile_cookies.py）。
+try:
+    from profile_cookies import get_fresh_cookies
+except Exception:  # 模块缺失时不拖垮整个 MCP
+    async def get_fresh_cookies(acc, ttl=300):
+        return acc.get("cookies", {})
+
 mcp = FastMCP("doubao-web")
 
 OUT_DIR = Path(os.environ.get("DOUBAO_OUT_DIR", "~/Downloads/豆包输出")).expanduser()
@@ -119,9 +137,10 @@ def _pick_account():
     return accounts, acc or accounts[0]
 
 
-def _new_client(acc: dict, timeout: float = 180) -> DoubaoChatClient:
+def _new_client(acc: dict, cookies=None, timeout: float = 180) -> DoubaoChatClient:
+    cookies = cookies or acc.get("cookies", {})
     return DoubaoChatClient(
-        cookies=acc["cookies"], ms_token="",
+        cookies=cookies, ms_token="",
         device_id=DEFAULT_DEVICE_ID, web_id=DEFAULT_WEB_ID, fp=DEFAULT_FP,
         timeout_seconds=timeout,
     )
@@ -234,7 +253,8 @@ async def doubao_ping() -> str:
     if not acc:
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
     try:
-        async with _new_client(acc, timeout=90) as c:
+        cookies = await get_fresh_cookies(acc)
+        async with _new_client(acc, cookies=cookies, timeout=90) as c:
             r = await c.chat_completion("说：好")
         return f"✅ 账号[{acc['name']}] 链路正常（回复：{(r.text or '').strip()[:30]}）。可对话 / 生图 / 生视频。"
     except Exception as e:
@@ -249,7 +269,8 @@ async def doubao_chat(prompt: str, model: str = "doubao") -> str:
     if not acc:
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
     try:
-        async with _new_client(acc) as c:
+        cookies = await get_fresh_cookies(acc)
+        async with _new_client(acc, cookies=cookies) as c:
             r = await c.chat_completion(prompt)
         return r.text or "(空响应)"
     except Exception as e:
@@ -297,6 +318,10 @@ async def doubao_image(
 ) -> str:
     """文生图或图生图。传 image_path 即为图生图。返回本地图片路径。
 
+    输出默认**无「豆包 AI 生成」水印**（走 memory_type=0 + image_raw/dwm3 取链）。
+    ratio 由服务端按描述文本决定，这里会自动把目标比例写进描述，
+    原生比例仍不符时本地用模糊背景补齐（主体不裁切）。
+
     ratio: 1:1 / 16:9 / 9:16 / 4:3 / 3:4 / 21:9
     image_model: 图片模型（留空=服务端默认 Seedream 4.0）：
       - Seedream 5.0 Flash（专业快速，推荐）
@@ -312,7 +337,8 @@ async def doubao_image(
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
     ref_key = ""
     try:
-        async with _new_client(acc, timeout=300) as c:
+        cookies = await get_fresh_cookies(acc)
+        async with _new_client(acc, cookies=cookies, timeout=300) as c:
             if image_path:
                 p = Path(image_path).expanduser()
                 if not p.exists():
@@ -365,6 +391,45 @@ async def doubao_image(
         return _fail(e)
 
 
+async def _download_video_clean(v, acc: dict, conv_id: str):
+    """内部 helper（不是 MCP 工具）：三级视频下载，优先拿无水印版：
+      1) 纯 API（get_without_watermark?vid=…，最快）→ 2) 无头浏览器点面板（最稳）
+      → 3) 带印原链接（MCP 原有行为兜底）。
+    返回 (path, channel_label)。全部失败抛异常。
+    """
+    key = time.strftime("%Y%m%d_%H%M%S")
+    base = str(OUT_DIR / f"doubao_{key}")
+    out = base + ".mp4"
+    vid = getattr(v, "vid", "") or ""
+    cookies = await get_fresh_cookies(acc)
+
+    # 1) 纯 API 无水印（优先、最快）
+    if vid and download_clean_video is not None:
+        try:
+            await download_clean_video(vid, cookies, conv_id, out)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return out, "无水印(API)"
+        except Exception as e:
+            print(f"[clean-dl] API 无水印失败，转无头面板：{e}")
+
+    # 2) 无头浏览器点面板下载（回退、稳）
+    if download_video_panel is not None:
+        try:
+            if os.path.exists(out) and os.path.getsize(out) == 0:
+                os.remove(out)
+            await download_video_panel(vid, cookies, conv_id, out)
+            if os.path.exists(out) and os.path.getsize(out) > 0:
+                return out, "无水印(无头面板)"
+        except Exception as e:
+            print(f"[clean-dl] 无头面板失败，转带印原链接：{e}")
+
+    # 3) 带印原链接兜底（MCP 原有行为）
+    url = getattr(v, "video_url", "") or getattr(v, "url", "")
+    if url:
+        return _save(url, ".mp4"), "带水印(原链接)"
+    raise RuntimeError(f"无可用视频下载链接 (vid={vid})")
+
+
 @mcp.tool()
 async def doubao_video(
     prompt: str,
@@ -386,6 +451,12 @@ async def doubao_video(
     wait: 等待成品的秒数（默认 600=10 分钟，与官方预计等待时间匹配）；
           传 0 = 只提交任务，立即返回会话链接。
 
+    输出默认**无「豆包 AI 生成」水印**：三级下载——
+      ① 纯 API `get_without_watermark?vid=`（最快）
+      ② 无头浏览器点右侧面板下载（稳，100% 干净）
+      ③ 带印原链接兜底。
+    返回文本里的「下载通道：」标明实际走了哪一级，看到「带水印(原链接)」＝前两级都失败。
+
     🔒 账号额度说明（2026-10-19 实测）：视频生成走新统一端点
     （/chat/completion + chat_ability ability_type=17），模型/时长/比例精确选择。
     提交后服务端先回「参数确认卡」，客户端自动二次回复「确认」，
@@ -400,7 +471,8 @@ async def doubao_video(
         return "⚪ 未配置账号（见 doubao_accounts 说明）"
     ref_key = ""
     try:
-        async with _new_client(acc, timeout=400) as c:
+        cookies = await get_fresh_cookies(acc)
+        async with _new_client(acc, cookies=cookies, timeout=400) as c:
             if image_path:
                 p = Path(image_path).expanduser()
                 if not p.exists():
@@ -419,14 +491,23 @@ async def doubao_video(
             # 成品到手（轮询会话取回 or 服务端偶发同步返回）
             if result.videos:
                 v = result.videos[0]
-                url = getattr(v, "video_url", "") or getattr(v, "url", "")
-                if url:
-                    path = _save(url, ".mp4")
-                    extra = f"\n   vid：{v.vid}" if getattr(v, "vid", "") else ""
-                    eff = getattr(result, "model", "")
-                    if eff:
-                        extra += f"\n   模型：{eff}"
-                    return f"✅ 视频已保存：{path}{extra}"
+                conv_id = getattr(result, "conversation_id", "") or ""
+                try:
+                    path, channel = await _download_video_clean(v, acc, conv_id)
+                except Exception as ex:
+                    # 全部下载通道失败：最后再试一次原链接（最保守兜底）
+                    url = getattr(v, "video_url", "") or getattr(v, "url", "")
+                    if url:
+                        path = _save(url, ".mp4")
+                        channel = "带水印(原链接)"
+                    else:
+                        return f"❌ 视频下载失败：{ex}"
+                extra = f"\n   vid：{v.vid}" if getattr(v, "vid", "") else ""
+                extra += f"\n   下载通道：{channel}"
+                eff = getattr(result, "model", "")
+                if eff:
+                    extra += f"\n   模型：{eff}"
+                return f"✅ 视频已保存：{path}{extra}"
 
             reply = getattr(result, "agent_reply", "") or ""
 
@@ -444,6 +525,17 @@ async def doubao_video(
                     "   解决：改用免费档模型，或切换有订阅的账号（doubao_accounts），\n"
                     "   或开通正式订阅：https://www.doubao.com/member/subscription"
                     "?default_sku_key=doubao_personal_std&enter_method=answer_quota_limiting"
+                )
+
+            # 🔴 当日免费次数用完：agent 回的是正常文案，会被下面的「⏳ 已提交」分支
+            # 误判成任务在跑（2026-10-23 实测：一帧没渲，却返回会话链接像成功）。
+            if "免费次数用完" in reply or ("今日" in reply and "用完" in reply):
+                return (
+                    f"🚫 账号（{acc.get('name', '?')}）今日视频免费次数已用完，"
+                    "任务**未进入渲染**（不是提交成功）。\n"
+                    f"   豆包提示：{reply[:120]}\n"
+                    "   解决：切换其他有额度的账号（doubao_accounts action=switch）后重试，"
+                    "或等次日额度恢复；开通订阅可免等待。"
                 )
 
             # 风控拦截

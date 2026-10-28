@@ -140,6 +140,32 @@ def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
     return None
 
 
+# ---- 比例提示注入 ---------------------------------------------------------
+# 实测（2026-10-23，Seedream 5.0 Flash / 新端点 ability_type=3）：
+#   ability_param.ratio 传 "9:16" 与传 "1:1" 拿到的原图都是 2720x1520（16:9），
+#   比例参数被服务端忽略；只有把比例写进**描述文本**（"竖屏 9:16 构图"）才真的
+#   出 1520x2720。所以这里把比例翻译成自然语言塞进 prompt，避免上层只能用
+#   模糊边距去凑画幅（direct_server._fit_ratio 保留为兜底）。
+_RATIO_TEXT = {
+    "9:16": "竖屏 9:16",
+    "16:9": "横屏 16:9",
+    "1:1": "正方形 1:1",
+    "4:3": "横屏 4:3",
+    "3:4": "竖屏 3:4",
+    "21:9": "超宽横屏 21:9",
+}
+
+
+def append_ratio_hint(text: str, ratio: Optional[str]) -> str:
+    """把目标比例写进描述；描述里已经提到该比例时原样返回，不重复堆叠。"""
+    if not ratio or ":" not in ratio:
+        return text
+    label = _RATIO_TEXT.get(ratio.strip(), ratio.strip())
+    if label in text or ratio.strip() in text:
+        return text
+    return f"{text}。画面比例 {label}，主体充满整个画幅，不要留白边或分屏"
+
+
 # ---- vendored (was: from .browser_client import resolve_memory_type) ----
 def resolve_memory_type(
     memory_type: Optional[int] = None,
@@ -1894,7 +1920,7 @@ class DoubaoChatClient:
                     code = err.get("error_code", "")
                     if code in RISK_ERROR_CODES:
                         raise DoubaoRateLimitError(
-                            f"ability rate limited: {code}")
+                            code, f"ability rate limited: {code}")
                     raise DoubaoChatError(
                         f"ability stream error: {str(err)[:300]}")
                 except json.JSONDecodeError:
@@ -1966,6 +1992,7 @@ class DoubaoChatClient:
         text = prompt
         if style:
             text = f"{prompt}。图片风格为{IMAGE_STYLE_LABELS.get(style, style)}"
+        text = append_ratio_hint(text, ratio)
         # 图片的 ability_param 是嵌套包装（抓包真值）
         inner = {
             "ability_param": {
@@ -1979,7 +2006,7 @@ class DoubaoChatClient:
             "ability_type": 1,
         }
         payload = self._build_ability_payload(
-            prompt, 3, inner, "生成图片：%s",
+            text, 3, inner, "生成图片：%s",
         )
         raw = await self._post_ability(payload, timeout)
         return self._parse_image_ability_sse(raw, prompt, model)
@@ -2249,6 +2276,7 @@ class DoubaoChatClient:
         text = prompt
         if style:
             text = f"{prompt}。图片风格为{IMAGE_STYLE_LABELS.get(style, style)}"
+        text = append_ratio_hint(text, ratio)
         content_dict: Dict[str, Any] = {"text": text}
         if ratio:
             content_dict["ratio"] = ratio
@@ -2824,7 +2852,7 @@ class DoubaoChatClient:
                             width=width,
                             height=height,
                             duration=float(v.get("duration") or 0.0),
-                            vid=v.get("vid", ""),
+                            vid=v.get("vid") or v.get("video_id") or v.get("id") or "",
                         )
         return None
 

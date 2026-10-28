@@ -9,8 +9,8 @@
 | 工具 | 功能 | 传输方式 |
 |---|---|---|
 | `doubao_chat` | 文本对话 / 写稿 / 审片 / 起标题（支持深度思考） | 纯 HTTP，免签名 |
-| `doubao_image` | 文生图 / 图生图，**四档图片模型 + 32 种风格**可选，自动落盘 | 纯 HTTP，免签名 |
-| `doubao_video` | 文生视频 / 图生视频，**四档视频模型 + 时长/比例**可选，轮询会话取回成品并落盘 mp4 | 纯 HTTP，免签名 |
+| `doubao_image` | 文生图 / 图生图，**四档图片模型 + 32 种风格**可选，**无水印**落盘 | 纯 HTTP，免签名 |
+| `doubao_video` | 文生视频 / 图生视频，**四档视频模型 + 时长/比例**可选，轮询会话取回成品，**无水印**落盘 mp4 | 纯 HTTP，免签名（失败回退无头面板） |
 | `doubao_models` | 查询官方模型/风格清单（含付费墙与消耗倍率标注） | — |
 | `doubao_accounts` | 账号池管理（list / switch 多账号切换） | — |
 | `doubao_ping` | 链路自检（登录态 + IP 风控状态） | — |
@@ -285,10 +285,43 @@ Pro 档在旧格式正常出图=被忽略；新格式则正确拦截）。
    「当前账号生成**并保存的** AI 图片、视频将不再显示水印」的措辞完全一致。
 2. **URL 签名覆盖整个 path（含模板名）**，所以手工把 `lwm3` 改成 `dwm3` 会直接
    `400 ImageX code:2004` —— 只能让服务端自己发无水印模板。
-3. `memory_type=0` 时服务端会走 agent 通道，**忽略 `ratio` 参数**，出图比例随机。
-   本项目用「模糊背景填充」在本地把图修正到精确目标比例（主体完整不裁切）。
+3. **比例参数两边都不生效**（2026-10-23 A/B 实测，Seedream 5.0 Flash）：
+   新端点 `ability_param.ratio` 传 `9:16` 与传 `1:1` 拿到的原图都是 2720×1520（16:9），
+   旧 agent 通道（`memory_type=0`）同样忽略 `ratio`。
+   **只有把比例写进描述文本才真的出对应画幅**——同一 prompt 加上「竖屏 9:16 构图」
+   后拿到 1520×2720。因此 `doubao_client.append_ratio_hint()` 会自动把目标比例
+   翻译成自然语言塞进描述；`direct_server._fit_ratio()` 的「模糊背景填充」降级为
+   兜底（原生比例已对时不做任何处理）。
 4. 账号开关本身（`POST /creativity/user_config/get` → `config_map["1"].watermark_option.is_on`）
    是账号级的，但**去水印与否最终由服务端按资源策略决定**，开关改不了已生成资源。
+
+### 🎞 视频无水印下载（2026-10-23 实测打通）
+
+卡片里的 `download_url` / `video_list.video_1.main_url` 带 `lr=video_gen_watermark_dyn`，
+下载到的是**带「豆包 AI 生成」水印**的版本；网页端「点视频 → 右侧面板 → 下载」
+拿到的是同一视频的另一个签名文件 `lr=unwatermarked`。干净链接由
+
+```
+POST https://www.doubao.com/creativity/resource/get_without_watermark?vid=<vid>&<security_params>
+     body: {}      # vid 必须是 query 参数
+```
+
+返回（`data.without_watermark=true` + `data.download_video.*.download_url`）。已排雷的坑：
+
+1. `vid` 放 **query**，放 body 返回 `710010202`；参数名就是 `vid`（不是 `resource_id`/`item_id`）。
+2. Cookie 要拼成字符串直接塞 `Cookie` 头——aiohttp 的 `ClientSession(cookies=dict)` 因缺
+   domain 不发 `sessionid`，接口会回 `without_watermark=false`。
+3. 必须带 `Referer: https://www.doubao.com/chat/<conversation_id>`，`aid` 用视频端点的 `497858`。
+4. 不需要任何会话初始化（GET 聊天页 / `latest_messagelist` 都不必），单发这一条即可。
+5. 干净 URL 是带鉴权的 CDN 签名链接，流式下载即可（`read_bufsize` 默认值会 `ContentLengthError`）。
+
+`direct_server._download_video_clean()` 按三级降级：**① 纯 API 无水印 → ② Playwright 无头
+面板下载（`doubao_video_headless_dl`，重但 100% 干净）→ ③ 带印原链接兜底**，
+返回值里用「下载通道：」标明实际走了哪一级。
+
+判定水印的对照方法（同一 vid 才有说服力）：分别按 `lr=video_gen_watermark_dyn` 与
+`lr=unwatermarked` 下载，取同一时间戳抽帧对比——带印版右下角有「豆包 AI 生成」，
+无水印版没有。
 
 ## 📄 协议要点（逆向笔记）
 - 对话：`POST /chat/completion`（新版端点，免签名），payload 为 `client_meta/messages[].content_block[{block_type:10000,text_block}]/option/ext` 结构，**必须带 `Agw-Js-Conv: str` 头**。
